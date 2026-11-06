@@ -443,6 +443,10 @@ struct server_slot {
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
+        spec_gate_ewma = 4.0f;
+        spec_gate_skip = 0;
+        spec_gate_backoff = 0;
+        spec_gate_plain = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -563,6 +567,28 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // experimental: skip the drafter while it does not pay (env BENCH_SPEC_GATE = tokens per cycle to break even)
+    float spec_gate_ewma    = 4.0f; // tokens per verify cycle
+    int   spec_gate_skip    = 0;    // plain cycles left before the next probe
+    int   spec_gate_backoff = 0;
+    int   spec_gate_plain   = 0;    // stats
+
+    void spec_gate_update(float tokens) {
+        static const float thr = getenv("BENCH_SPEC_GATE") ? (float) atof(getenv("BENCH_SPEC_GATE")) : 0.0f;
+        static const int   cap = getenv("BENCH_SPEC_GATE_MAX") ? atoi(getenv("BENCH_SPEC_GATE_MAX")) : 32;
+        if (thr <= 0.0f) {
+            return;
+        }
+        spec_gate_ewma += 0.25f*(tokens - spec_gate_ewma);
+        if (spec_gate_ewma < thr) {
+            spec_gate_backoff = std::min(cap, spec_gate_backoff ? 2*spec_gate_backoff : 4);
+            spec_gate_skip    = spec_gate_backoff;
+            spec_gate_ewma    = std::max(spec_gate_ewma, thr - 0.5f); // one good probe is enough to come back
+        } else {
+            spec_gate_backoff = 0;
+        }
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -3872,7 +3898,14 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+
+                if (n_draft_max > 0 && slot.spec_draft.empty() && slot.spec_gate_skip > 0) {
+                    // a plain cycle: the drafter still gets the target features through process()
+                    slot.spec_gate_skip--;
+                    slot.spec_gate_plain++;
+                    n_draft_max = 0;
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -5031,6 +5064,7 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            slot.spec_gate_update(1.0f + (float) n_accepted);
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
