@@ -737,9 +737,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            // experimental: at a split boundary the scheduler can place the fused op on the neighbouring
-            // GPU, which is harmless; only a fallback to the CPU is a real mismatch
-            static const bool boundary_ok = getenv("BENCH_FUSE_BOUNDARY") != nullptr;
+            // at a split boundary the scheduler can place the fused op on the neighbouring GPU,
+            // which is harmless; only a fallback to the CPU is a real mismatch.
+            // BENCH_FUSE_BOUNDARY=0 restores the check that disables the op for every layer.
+            static const bool boundary_ok = !getenv("BENCH_FUSE_BOUNDARY") || strcmp(getenv("BENCH_FUSE_BOUNDARY"), "0") != 0;
             if (boundary_ok && device_fused && device_layer && device_fused != device_layer &&
                     ggml_backend_dev_type(device_fused) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 continue;
