@@ -213,6 +213,22 @@ export interface ApiModelDetails {
 	};
 }
 
+export interface ApiSteeringVector {
+	file: string;
+	label: string;
+	attn: number;
+	ffn: number;
+	resid: number;
+}
+
+export interface ApiSteeringState {
+	file: string | null;
+	attn: number;
+	ffn: number;
+	resid: number;
+	available: ApiSteeringVector[];
+}
+
 export interface ApiLlamaCppServerProps {
 	default_generation_settings: {
 		id: number;

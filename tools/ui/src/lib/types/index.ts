@@ -20,6 +20,8 @@ export type {
 	ApiModelsDownloadResponse,
 	ApiModelDetails,
 	ApiLlamaCppServerProps,
+	ApiSteeringState,
+	ApiSteeringVector,
 	ApiChatCompletionRequest,
 	ApiChatCompletionToolCallFunctionDelta,
 	ApiChatCompletionToolCallDelta,

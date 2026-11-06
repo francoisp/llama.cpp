@@ -4,6 +4,7 @@
 	import {
 		ChatFormActionReasoning,
 		ChatFormActionRecord,
+		ChatFormActionSteering,
 		ChatFormActionsAdd,
 		ChatFormActionSubmit,
 		ChatFormContextGauge,
@@ -163,6 +164,8 @@
 		{/if}
 
 		{#if showModelSelector}
+			<ChatFormActionSteering disabled={disabled || isLoading} />
+
 			<ChatFormActionReasoning />
 
 			<ModelsSelector

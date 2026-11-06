@@ -199,6 +199,12 @@ export { default as ChatFormActionSubmit } from './ChatForm/ChatFormActions/Chat
 export { default as ChatFormActionReasoning } from './ChatForm/ChatFormActions/ChatFormActionReasoning.svelte';
 
 /**
+ * Dropdown that loads or unloads a directional steering vector on the server.
+ * Renders nothing unless the server offers vectors.
+ */
+export { default as ChatFormActionSteering } from './ChatForm/ChatFormActions/ChatFormActionSteering.svelte';
+
+/**
  * Dropdown submenu for managing tool permissions in the chat form.
  *
  * Displays a collapsible list of available tools organized by group (Built-in / JSON Schema).
