@@ -1,5 +1,7 @@
 #include "llama-model-loader.h"
 
+#include <mutex>
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1576,6 +1578,17 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    // experimental: with BENCH_LOAD_PARALLEL one thread per GPU context runs this function
+    static const bool parallel_load = getenv("BENCH_LOAD_PARALLEL") != nullptr && !use_mmap;
+    static std::mutex parallel_mutex;
+    std::vector<std::unique_ptr<llama_file>> local_files;
+    if (parallel_load) {
+        for (const auto & f : files) {
+            const std::string p = "/proc/self/fd/" + std::to_string(f->file_id());
+            local_files.emplace_back(new llama_file(p.c_str(), "rb", use_direct_io));
+        }
+    }
+
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
@@ -1588,13 +1601,15 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment :
+        (parallel_load ? 64 : 1) * 1024 * 1024;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
+        std::lock_guard<std::mutex> lock(parallel_mutex);
         if (use_mmap || check_tensors) {
             return nullptr;
         }
@@ -1692,6 +1707,17 @@ bool llama_model_loader::load_all_data(
             return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
         });
     }
+    // experimental: file order keeps each reader sequential, so ZFS prefetch can follow it
+    if (parallel_load) {
+        std::stable_sort(tensors.begin(), tensors.end(), [&](const ggml_tensor * a, const ggml_tensor * b) {
+            const auto * wa = get_weight(ggml_get_name(a));
+            const auto * wb = get_weight(ggml_get_name(b));
+            if (!wa || !wb) {
+                return wa != nullptr && wb == nullptr;
+            }
+            return wa->idx != wb->idx ? wa->idx < wb->idx : wa->offs < wb->offs;
+        });
+    }
 
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
@@ -1703,6 +1729,7 @@ bool llama_model_loader::load_all_data(
         }
 
         if (progress_callback) {
+            std::lock_guard<std::mutex> lock(parallel_mutex);
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
@@ -1749,7 +1776,7 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
-            const auto & file = files.at(weight->idx);
+            const auto & file = (local_files.empty() ? files : local_files).at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
@@ -1840,7 +1867,10 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-        size_done += n_size;
+        {
+            std::lock_guard<std::mutex> lock(parallel_mutex);
+            size_done += n_size;
+        }
     }
 
     // free temporary resources used for async uploads

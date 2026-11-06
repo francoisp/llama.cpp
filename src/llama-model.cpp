@@ -1,5 +1,8 @@
 #include "llama-model.h"
 
+#include <atomic>
+#include <thread>
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -2130,7 +2133,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    // experimental: one reader thread per device buffer, like ds4's expert loader
+    const bool parallel_load = getenv("BENCH_LOAD_PARALLEL") != nullptr && !ml.use_mmap;
+    const auto is_device = [&](const std::vector<ggml_backend_buffer_t> & bufs) {
+        return parallel_load && !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
+    };
+    if (parallel_load) {
+        std::vector<std::thread> readers;
+        std::atomic<bool> ok{true};
+        for (auto & item : ctx_bufs) {
+            if (!is_device(item.second)) {
+                continue;
+            }
+            readers.emplace_back([&, c = item.first, b = &item.second]() {
+                if (!ml.load_all_data(c, *b, nullptr, params.progress_callback, params.progress_callback_user_data)) {
+                    ok = false;
+                }
+            });
+        }
+        for (auto & t : readers) {
+            t.join();
+        }
+        if (!ok) {
+            return false;
+        }
+    }
     for (auto & [ctx, bufs] : ctx_bufs) {
+        if (is_device(bufs)) {
+            continue;
+        }
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
