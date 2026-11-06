@@ -1,6 +1,9 @@
 #include "llama-model.h"
 
 #include <atomic>
+#include <cstring>
+#include <exception>
+#include <mutex>
 #include <thread>
 
 #include "llama-arch.h"
@@ -1698,6 +1701,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // a full offload to several GPUs reads into each GPU directly: mmap would page the whole model in first
+    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO && n_gpu_layers >= n_layer_all) {
+        size_t n_gpus = 0;
+        for (const auto & dev : devices) {
+            n_gpus += ggml_backend_dev_type(dev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+        if (n_gpus > 1) {
+            ml.use_mmap = false;
+        }
+    }
+
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {
@@ -2133,26 +2147,61 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
-    // experimental: one reader thread per device buffer, like ds4's expert loader
-    const bool parallel_load = getenv("BENCH_LOAD_PARALLEL") != nullptr && !ml.use_mmap;
+    // with several GPUs each one gets its own reader thread; BENCH_LOAD_PARALLEL=0 turns this off
+    const auto device_buffer = [](const std::vector<ggml_backend_buffer_t> & bufs) {
+        return !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
+    };
+    const char * parallel_env = getenv("BENCH_LOAD_PARALLEL");
+    bool parallel_load = !ml.use_mmap && !ml.check_tensors && ml.file_paths.size() == ml.files.size() &&
+        !(parallel_env && strcmp(parallel_env, "0") == 0);
+    size_t n_device_ctx = 0;
+    for (const auto & item : ctx_bufs) {
+        if (!device_buffer(item.second)) {
+            continue;
+        }
+        n_device_ctx++;
+        // a reader must not wait for the upload of another one
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(item.second[0]));
+        ggml_backend_dev_props props;
+        if (dev) {
+            ggml_backend_dev_get_props(dev, &props);
+        }
+        parallel_load = parallel_load && dev && props.caps.async && props.caps.events;
+    }
+    parallel_load = parallel_load && n_device_ctx > 1;
     const auto is_device = [&](const std::vector<ggml_backend_buffer_t> & bufs) {
-        return parallel_load && !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
+        return parallel_load && device_buffer(bufs);
     };
     if (parallel_load) {
+        ml.parallel_load = true;
         std::vector<std::thread> readers;
         std::atomic<bool> ok{true};
+        std::exception_ptr error;
+        std::mutex error_mutex;
         for (auto & item : ctx_bufs) {
             if (!is_device(item.second)) {
                 continue;
             }
             readers.emplace_back([&, c = item.first, b = &item.second]() {
-                if (!ml.load_all_data(c, *b, nullptr, params.progress_callback, params.progress_callback_user_data)) {
-                    ok = false;
+                // an exception must not leave the thread, it would terminate the process
+                try {
+                    if (!ml.load_all_data(c, *b, nullptr, params.progress_callback, params.progress_callback_user_data)) {
+                        ok = false;
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!error) {
+                        error = std::current_exception();
+                    }
                 }
             });
         }
         for (auto & t : readers) {
             t.join();
+        }
+        ml.parallel_load = false;
+        if (error) {
+            std::rethrow_exception(error);
         }
         if (!ok) {
             return false;

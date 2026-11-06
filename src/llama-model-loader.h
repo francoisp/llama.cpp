@@ -116,6 +116,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> file_paths; // empty when loading from a FILE *, which cannot be reopened
+    bool parallel_load = false;          // load_all_data runs on one thread per device buffer
     llama_ftype ftype;
     llama_fver  fver;
 

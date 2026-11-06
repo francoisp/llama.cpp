@@ -584,6 +584,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -652,6 +653,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1578,14 +1580,12 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
-    // experimental: with BENCH_LOAD_PARALLEL one thread per GPU context runs this function
-    static const bool parallel_load = getenv("BENCH_LOAD_PARALLEL") != nullptr && !use_mmap;
+    // with parallel_load one thread per device buffer runs this function, each with its own file handles
     static std::mutex parallel_mutex;
     std::vector<std::unique_ptr<llama_file>> local_files;
     if (parallel_load) {
-        for (const auto & f : files) {
-            const std::string p = "/proc/self/fd/" + std::to_string(f->file_id());
-            local_files.emplace_back(new llama_file(p.c_str(), "rb", use_direct_io));
+        for (const auto & path : file_paths) {
+            local_files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
         }
     }
 
@@ -1707,7 +1707,7 @@ bool llama_model_loader::load_all_data(
             return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
         });
     }
-    // experimental: file order keeps each reader sequential, so ZFS prefetch can follow it
+    // file order keeps each reader sequential, so filesystem prefetch can follow it
     if (parallel_load) {
         std::stable_sort(tensors.begin(), tensors.end(), [&](const ggml_tensor * a, const ggml_tensor * b) {
             const auto * wa = get_weight(ggml_get_name(a));
@@ -1897,7 +1897,12 @@ bool llama_model_loader::load_all_data(
     }
 
     // check if this is the last call and do final cleanup
-    if (size_done >= size_data) {
+    bool last_call;
+    {
+        std::lock_guard<std::mutex> lock(parallel_mutex);
+        last_call = size_done >= size_data;
+    }
+    if (last_call) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
@@ -1912,6 +1917,7 @@ bool llama_model_loader::load_all_data(
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
+            std::lock_guard<std::mutex> lock(parallel_mutex);
             return progress_callback(1.0f, progress_callback_user_data);
         }
     }
