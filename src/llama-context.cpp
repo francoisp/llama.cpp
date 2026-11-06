@@ -192,8 +192,10 @@ static void steer_load_env(const llama_model & model, llama_adapter_cvec & cvec)
     if (f) {
         fclose(f);
     }
+    // a file without scales steers the FFN output at scale 1
+    const bool no_scales = !getenv("BENCH_STEER_ATTN") && !getenv("BENCH_STEER_FFN") && !getenv("BENCH_STEER_RESID");
     if (n_read != dirs.size() ||
-            !cvec.apply_steering(model, dirs.data(), dirs.size(), env("BENCH_STEER_ATTN"), env("BENCH_STEER_FFN"), env("BENCH_STEER_RESID"))) {
+            !cvec.apply_steering(model, dirs.data(), dirs.size(), env("BENCH_STEER_ATTN"), no_scales ? 1.0f : env("BENCH_STEER_FFN"), env("BENCH_STEER_RESID"))) {
         throw std::runtime_error(std::string("failed to load steering file ") + path);
     }
     LLAMA_LOG_INFO("%s: %s attn=%g ffn=%g resid=%g\n", __func__, path, cvec.steer_attn, cvec.steer_ffn, cvec.steer_resid);

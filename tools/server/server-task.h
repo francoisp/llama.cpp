@@ -249,7 +249,8 @@ struct server_task {
         float attn  = 0.0f;
         float ffn   = 0.0f;
         float resid = 0.0f;
-        bool  clear_cache = false;
+        bool  clear_cache  = false;
+        bool  use_defaults = false; // take the scales from the vector's NAME.json
     };
     set_steering_params set_steering;
 

@@ -1140,11 +1140,60 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // vectors a client can pick: NAME.f32 inside LLAMA_STEERING_DIR with its scales in NAME.json
+    json steering_available() const {
+        json res = json::array();
+
+        const char * dir = getenv("LLAMA_STEERING_DIR");
+        char arch[32] = "";
+        llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
+        if (!dir || std::string(arch) != "deepseek41") {
+            return res;
+        }
+
+        std::vector<std::filesystem::path> files;
+        std::error_code ec;
+        for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (entry.path().extension() == ".f32") {
+                files.push_back(entry.path());
+            }
+        }
+        std::sort(files.begin(), files.end());
+
+        for (const auto & path : files) {
+            std::ifstream f(std::filesystem::path(path).replace_extension(".json"));
+            if (!f) {
+                continue;
+            }
+            try {
+                const json scales = json::parse(std::string(std::istreambuf_iterator<char>(f), {}));
+                res.push_back({
+                    {"file",  path.filename().string()},
+                    {"label", json_value(scales, "label", path.stem().string())},
+                    {"attn",  json_value(scales, "attn",  0.0f)},
+                    {"ffn",   json_value(scales, "ffn",   0.0f)},
+                    {"resid", json_value(scales, "resid", 0.0f)},
+                });
+            } catch (const std::exception & e) {
+                SRV_WRN("ignoring scales of %s: %s\n", path.c_str(), e.what());
+            }
+        }
+
+        return res;
+    }
+
+    json steering_response() const {
+        json res = steering_state;
+        res["available"] = steering_available();
+        return res;
+    }
+
     // directional steering currently set on ctx_tgt
     json steering_state = {
         {"file",  getenv("BENCH_STEER_FILE") ? json(getenv("BENCH_STEER_FILE")) : json(nullptr)},
         {"attn",  getenv("BENCH_STEER_ATTN")  ? atof(getenv("BENCH_STEER_ATTN"))  : 0.0},
-        {"ffn",   getenv("BENCH_STEER_FFN")   ? atof(getenv("BENCH_STEER_FFN"))   : 0.0},
+        {"ffn",   getenv("BENCH_STEER_FFN")   ? atof(getenv("BENCH_STEER_FFN"))   :
+                  getenv("BENCH_STEER_FILE") && !getenv("BENCH_STEER_ATTN") && !getenv("BENCH_STEER_RESID") ? 1.0 : 0.0},
         {"resid", getenv("BENCH_STEER_RESID") ? atof(getenv("BENCH_STEER_RESID")) : 0.0},
     };
 
@@ -3456,16 +3505,34 @@ private:
                 {
                     auto res = std::make_unique<server_task_result_steering>();
                     res->id = task.id;
-                    res->state = steering_state;
+                    res->state = steering_response();
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SET_STEERING:
                 {
-                    const auto & st = task.set_steering;
+                    auto st = task.set_steering;
 
                     std::string error;
+                    if (st.use_defaults && !st.file.empty()) {
+                        // a vector without a NAME.json steers the FFN output at scale 1
+                        st.ffn = 1.0f;
+                        for (const auto & vec : steering_available()) {
+                            if (vec.at("file") == st.file) {
+                                st.attn  = vec.at("attn").get<float>();
+                                st.ffn   = vec.at("ffn").get<float>();
+                                st.resid = vec.at("resid").get<float>();
+                            }
+                        }
+                    }
+
+                    for (const float scale : { st.attn, st.ffn, st.resid }) {
+                        if (!(scale >= -100.0f && scale <= 100.0f)) {
+                            error = "steering scales must be between -100 and 100";
+                        }
+                    }
+
                     std::vector<float> dirs;
-                    if (!st.file.empty()) {
+                    if (error.empty() && !st.file.empty()) {
                         // clients only name a file inside a directory chosen when the server starts
                         const char * dir = getenv("LLAMA_STEERING_DIR");
                         if (!dir) {
@@ -3514,7 +3581,7 @@ private:
 
                     auto res = std::make_unique<server_task_result_steering>();
                     res->id = task.id;
-                    res->state = steering_state;
+                    res->state = steering_response();
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -6951,6 +7018,7 @@ void server_routes::init_routes() {
             task.set_steering.ffn         = json_value(body, "ffn",   0.0f);
             task.set_steering.resid       = json_value(body, "resid", 0.0f);
             task.set_steering.clear_cache = json_value(body, "clear_cache", false);
+            task.set_steering.use_defaults = !body.contains("attn") && !body.contains("ffn") && !body.contains("resid");
             rd.post_task(std::move(task));
         }
 

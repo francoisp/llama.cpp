@@ -1299,7 +1299,11 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 ### GET `/steering`: Get the current directional steering
 
-Returns `file`, `attn`, `ffn` and `resid`. `file` is `null` when nothing is loaded.
+Returns `file`, `attn`, `ffn` and `resid`, with `file` set to `null` when nothing is loaded, and
+`available`, the vectors a client can pick. A vector is listed when `NAME.f32` in `LLAMA_STEERING_DIR`
+has a `NAME.json` next to it with its scales and an optional label, for example
+`{ "label": "My vector", "attn": 3.5, "resid": 3.5 }`. The web UI shows them in a dropdown on the
+chat form, which is hidden when the list is empty.
 
 ### POST `/steering`: Load, change or unload directional steering
 
@@ -1310,7 +1314,8 @@ the directory holding the vectors, as n_layer x n_embd F32 files.
 { "file": "direction.f32", "attn": 3.5, "ffn": 0, "resid": 3.5, "clear_cache": false }
 ```
 
-`{ "file": null }` unloads it. The change applies to every slot from the next decode, which rebuilds
+Scales must be between -100 and 100. Without scales, those in `NAME.json` are used, or `ffn` 1 when
+there is no such file. `{ "file": null }` unloads it. The change applies to every slot from the next decode, which rebuilds
 the graphs. Tokens already in the context keep the steering they were decoded with; `clear_cache`
 drops the prompt of idle slots and the prompt cache, so the next request is evaluated from the start.
 
