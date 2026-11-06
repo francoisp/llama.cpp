@@ -765,9 +765,62 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     return out;
 }
 
+// experimental: ds4 directional steering, see bench_steer_get() in llama-context.cpp
+struct bench_steer {
+    bool active = false;
+    float attn = 0.0f, ffn = 0.0f, resid = 0.0f;
+    std::vector<char> on; // layers with a nonzero direction
+};
+const bench_steer & bench_steer_get();
+
 llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
     llama_model_deepseek4::graph(params, no_build{}) {
     const auto & model = static_cast<const llama_model_deepseek41 &>(this->model);
+
+    // y -= scale * d * dot(d, y), y is n_embd x n_tokens (ds4 ds41_steer_site, attn and ffn sites)
+    const bench_steer & steer = bench_steer_get();
+    const auto steer_dir = [&](int il, float scale) -> ggml_tensor * {
+        if (!steer.active || scale == 0.0f || il < 0 || (size_t) il >= steer.on.size() || !steer.on[il]) {
+            return nullptr;
+        }
+        return cvec->tensor_for(il);
+    };
+    const auto steer_project = [&](ggml_tensor * y, int il, float scale, const char * name) -> ggml_tensor * {
+        ggml_tensor * d = steer_dir(il, scale);
+        if (!d) {
+            return y;
+        }
+        const int64_t w = y->ne[0], rows = y->ne[1];
+        ggml_tensor * yc = ggml_cont(ctx0, y);
+        cb(yc, "steer_pre", il);
+        ggml_tensor * dot = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, d, w, 1), yc);
+        ggml_prec_set_acc(dot, GGML_PREC_F32);
+        ggml_tensor * corr = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, d, 1, w), dot);
+        ggml_prec_set_acc(corr, GGML_PREC_F32);
+        ggml_tensor * out = ggml_add(ctx0, y, ggml_scale(ctx0, ggml_reshape_2d(ctx0, corr, w, rows), -scale));
+        cb(out, name, il);
+        return out;
+    };
+    // residual site: project the mean of the HC copies, same correction to every copy.
+    // y is n_embd x n_hc x n_tokens; equal to projecting the row on d tiled / sqrt(n_hc)
+    const auto steer_project_hc = [&](ggml_tensor * y, int il, float scale) -> ggml_tensor * {
+        ggml_tensor * d = steer_dir(il, scale);
+        if (!d) {
+            return y;
+        }
+        const int64_t w = y->ne[0], n_hc = y->ne[1], rows = y->ne[2];
+        ggml_tensor * yc = ggml_cont(ctx0, y);
+        cb(yc, "steer_pre_resid", il);
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, yc, w, n_hc*rows);
+        ggml_tensor * dots = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, d, w, 1), flat);
+        ggml_prec_set_acc(dots, GGML_PREC_F32);
+        ggml_tensor * mean = ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, dots, n_hc, rows)), 1.0f/(float) n_hc);
+        ggml_tensor * corr = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, d, 1, w), mean);
+        ggml_prec_set_acc(corr, GGML_PREC_F32);
+        ggml_tensor * out = ggml_add(ctx0, y, ggml_scale(ctx0, ggml_reshape_3d(ctx0, corr, w, 1, rows), -scale));
+        cb(out, "steer_resid", il);
+        return out;
+    };
 
     static const bool sparse_env = dsv41_env_on("LLAMA_DSV41_SPARSE");
     sparse = sparse_env;
@@ -857,6 +910,7 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         cb(cur, "attn_norm", il);
 
         cur = build_attention41(model, inp_dsv4, cur, inp_pos, cand_pin, il);
+        cur = steer_project(cur, il, steer.attn, "steer_attn");
 
         inpL = build_hc_post(cur, residual, attn_mix.post, attn_mix.comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -909,9 +963,10 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
+        cur = steer_project(cur, il, steer.ffn, "steer_ffn");
 
         inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
-        inpL = build_cvec(inpL, il);
+        inpL = steer.active ? steer_project_hc(inpL, il, steer.resid) : build_cvec(inpL, il);
         cb(inpL, "l_out", il);
     }
 

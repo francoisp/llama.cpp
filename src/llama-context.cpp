@@ -178,6 +178,53 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// experimental: ds4 directional steering. BENCH_STEER_FILE is n_layer x n_embd F32, one row per layer from 0
+struct bench_steer {
+    bool active = false;
+    float attn = 0.0f, ffn = 0.0f, resid = 0.0f;
+    std::vector<char> on; // layers with a nonzero direction
+};
+static bench_steer g_bench_steer;
+const bench_steer & bench_steer_get() {
+    return g_bench_steer;
+}
+static void bench_steer_load(const llama_model & model, llama_adapter_cvec & cvec) {
+    const char * path = getenv("BENCH_STEER_FILE");
+    if (!path || model.arch != LLM_ARCH_DEEPSEEK41) {
+        return;
+    }
+    const auto env = [](const char * name) { const char * v = getenv(name); return v ? (float) atof(v) : 0.0f; };
+    const size_t n_layer = model.hparams.n_layer(), n_embd = model.hparams.n_embd;
+    std::vector<float> dirs(n_layer*n_embd);
+    FILE * f = fopen(path, "rb");
+    if (!f || fread(dirs.data(), sizeof(float), dirs.size(), f) != dirs.size()) {
+        throw std::runtime_error(std::string("failed to read steering file ") + path);
+    }
+    fclose(f);
+    auto & g = g_bench_steer;
+    g.on.assign(n_layer, 0);
+    size_t n_on = 0;
+    for (size_t il = 0; il < n_layer; il++) {
+        double norm = 0;
+        for (size_t i = 0; i < n_embd; i++) {
+            norm += (double) dirs[il*n_embd + i]*dirs[il*n_embd + i];
+        }
+        g.on[il] = norm > 0;
+        n_on += g.on[il];
+    }
+    if (g.on[0]) {
+        throw std::runtime_error("steering direction for layer 0 is not supported: llama_adapter_cvec has no layer 0");
+    }
+    if (!cvec.apply(model, dirs.data() + n_embd, (n_layer - 1)*n_embd, (int32_t) n_embd, 1, (int32_t) n_layer - 1)) {
+        throw std::runtime_error("failed to set steering vectors");
+    }
+    g.attn = env("BENCH_STEER_ATTN");
+    g.ffn = env("BENCH_STEER_FFN");
+    g.resid = env("BENCH_STEER_RESID");
+    g.active = true;
+    fprintf(stderr, "BENCHSTEER %s: %zu of %zu layers, attn=%g ffn=%g resid=%g\n", path, n_on, n_layer, g.attn, g.ffn, g.resid);
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -190,6 +237,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    bench_steer_load(model, *cvec);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
