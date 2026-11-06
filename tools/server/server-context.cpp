@@ -1140,6 +1140,14 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // directional steering currently set on ctx_tgt
+    json steering_state = {
+        {"file",  getenv("BENCH_STEER_FILE") ? json(getenv("BENCH_STEER_FILE")) : json(nullptr)},
+        {"attn",  getenv("BENCH_STEER_ATTN")  ? atof(getenv("BENCH_STEER_ATTN"))  : 0.0},
+        {"ffn",   getenv("BENCH_STEER_FFN")   ? atof(getenv("BENCH_STEER_FFN"))   : 0.0},
+        {"resid", getenv("BENCH_STEER_RESID") ? atof(getenv("BENCH_STEER_RESID")) : 0.0},
+    };
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -3442,6 +3450,71 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_GET_STEERING:
+                {
+                    auto res = std::make_unique<server_task_result_steering>();
+                    res->id = task.id;
+                    res->state = steering_state;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SET_STEERING:
+                {
+                    const auto & st = task.set_steering;
+
+                    std::string error;
+                    std::vector<float> dirs;
+                    if (!st.file.empty()) {
+                        // clients only name a file inside a directory chosen when the server starts
+                        const char * dir = getenv("LLAMA_STEERING_DIR");
+                        if (!dir) {
+                            error = "start the server with LLAMA_STEERING_DIR set to load steering files";
+                        } else if (st.file.find_first_of("/\\") != std::string::npos || st.file == "..") {
+                            error = "file must be a file name inside LLAMA_STEERING_DIR";
+                        } else {
+                            dirs.resize((size_t) llama_model_n_layer(llama_get_model(ctx_tgt))*llama_model_n_embd(llama_get_model(ctx_tgt)));
+                            std::ifstream f(std::string(dir) + "/" + st.file, std::ios::binary | std::ios::ate);
+                            if (!f || (size_t) f.tellg() != dirs.size()*sizeof(float)) {
+                                error = "cannot read " + st.file + " as n_layer x n_embd F32";
+                            } else {
+                                f.seekg(0);
+                                f.read(reinterpret_cast<char *>(dirs.data()), dirs.size()*sizeof(float));
+                            }
+                        }
+                    }
+
+                    if (error.empty() && llama_set_adapter_steering(ctx_tgt, st.file.empty() ? nullptr : dirs.data(), dirs.size(), st.attn, st.ffn, st.resid) != 0) {
+                        error = "steering was rejected, see the server log";
+                    }
+
+                    if (!error.empty()) {
+                        send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    steering_state = {
+                        {"file",  st.file.empty() ? json(nullptr) : json(st.file)},
+                        {"attn",  st.file.empty() ? 0.0f : st.attn},
+                        {"ffn",   st.file.empty() ? 0.0f : st.ffn},
+                        {"resid", st.file.empty() ? 0.0f : st.resid},
+                    };
+
+                    // tokens already in the memory keep the steering they were decoded with
+                    if (st.clear_cache) {
+                        for (auto & slot : slots) {
+                            if (!slot.is_processing()) {
+                                slot.prompt_clear();
+                            }
+                        }
+                        if (prompt_cache) {
+                            prompt_cache->states.clear();
+                        }
+                    }
+
+                    auto res = std::make_unique<server_task_result_steering>();
+                    res->id = task.id;
+                    res->state = steering_state;
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -6830,6 +6903,68 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_steering = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_GET_STEERING);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_steering = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.is_object()) {
+            res->error(format_error_response("Request body must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SET_STEERING);
+            task.id = rd.get_new_id();
+            if (body.contains("file") && !body.at("file").is_null()) {
+                task.set_steering.file = body.at("file").get<std::string>();
+            }
+            task.set_steering.attn        = json_value(body, "attn",  0.0f);
+            task.set_steering.ffn         = json_value(body, "ffn",   0.0f);
+            task.set_steering.resid       = json_value(body, "resid", 0.0f);
+            task.set_steering.clear_cache = json_value(body, "clear_cache", false);
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
         res->ok(result->to_json());
         return res;
     };

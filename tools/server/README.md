@@ -1297,6 +1297,23 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+### GET `/steering`: Get the current directional steering
+
+Returns `file`, `attn`, `ffn` and `resid`. `file` is `null` when nothing is loaded.
+
+### POST `/steering`: Load, change or unload directional steering
+
+DeepSeek V4.1 only, without restarting the server. Start the server with `LLAMA_STEERING_DIR` set to
+the directory holding the vectors, as n_layer x n_embd F32 files.
+
+```json
+{ "file": "direction.f32", "attn": 3.5, "ffn": 0, "resid": 3.5, "clear_cache": false }
+```
+
+`{ "file": null }` unloads it. The change applies to every slot from the next decode, which rebuilds
+the graphs. Tokens already in the context keep the steering they were decoded with; `clear_cache`
+drops the prompt of idle slots and the prompt cache, so the next request is evaluated from the start.
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

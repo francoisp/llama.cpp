@@ -27,8 +27,29 @@ struct llama_adapter_cvec {
             int32_t il_start,
             int32_t il_end);
 
+    // directional steering (DeepSeek V4.1): the vectors are projected out at the attention output,
+    // the FFN output and the residual instead of added. data is n_layer x n_embd from layer 0,
+    // nullptr clears it. On a bad argument nothing changes and false is returned.
+    bool apply_steering(
+            const llama_model & model,
+            const float * data,
+            size_t len,
+            float attn,
+            float ffn,
+            float resid);
+
+    // the direction to project out of layer il, nullptr if there is nothing to do
+    ggml_tensor * steer_dir(int il, float scale) const;
+
+    bool  steer       = false;
+    float steer_attn  = 0.0f;
+    float steer_ffn   = 0.0f;
+    float steer_resid = 0.0f;
+
 private:
     bool init(const llama_model & model);
+
+    std::vector<char> steer_on; // layers with a nonzero direction
 
     int32_t layer_start = -1;
     int32_t layer_end   = -1;

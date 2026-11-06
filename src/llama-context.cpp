@@ -178,51 +178,25 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-// experimental: ds4 directional steering. BENCH_STEER_FILE is n_layer x n_embd F32, one row per layer from 0
-struct bench_steer {
-    bool active = false;
-    float attn = 0.0f, ffn = 0.0f, resid = 0.0f;
-    std::vector<char> on; // layers with a nonzero direction
-};
-static bench_steer g_bench_steer;
-const bench_steer & bench_steer_get() {
-    return g_bench_steer;
-}
-static void bench_steer_load(const llama_model & model, llama_adapter_cvec & cvec) {
+// directional steering for tools without a live switch: BENCH_STEER_FILE is n_layer x n_embd F32,
+// one row per layer from 0, BENCH_STEER_ATTN, BENCH_STEER_FFN and BENCH_STEER_RESID are the scales
+static void steer_load_env(const llama_model & model, llama_adapter_cvec & cvec) {
     const char * path = getenv("BENCH_STEER_FILE");
     if (!path || model.arch != LLM_ARCH_DEEPSEEK41) {
         return;
     }
     const auto env = [](const char * name) { const char * v = getenv(name); return v ? (float) atof(v) : 0.0f; };
-    const size_t n_layer = model.hparams.n_layer(), n_embd = model.hparams.n_embd;
-    std::vector<float> dirs(n_layer*n_embd);
+    std::vector<float> dirs((size_t) model.hparams.n_layer()*model.hparams.n_embd);
     FILE * f = fopen(path, "rb");
-    if (!f || fread(dirs.data(), sizeof(float), dirs.size(), f) != dirs.size()) {
-        throw std::runtime_error(std::string("failed to read steering file ") + path);
+    const size_t n_read = f ? fread(dirs.data(), sizeof(float), dirs.size(), f) : 0;
+    if (f) {
+        fclose(f);
     }
-    fclose(f);
-    auto & g = g_bench_steer;
-    g.on.assign(n_layer, 0);
-    size_t n_on = 0;
-    for (size_t il = 0; il < n_layer; il++) {
-        double norm = 0;
-        for (size_t i = 0; i < n_embd; i++) {
-            norm += (double) dirs[il*n_embd + i]*dirs[il*n_embd + i];
-        }
-        g.on[il] = norm > 0;
-        n_on += g.on[il];
+    if (n_read != dirs.size() ||
+            !cvec.apply_steering(model, dirs.data(), dirs.size(), env("BENCH_STEER_ATTN"), env("BENCH_STEER_FFN"), env("BENCH_STEER_RESID"))) {
+        throw std::runtime_error(std::string("failed to load steering file ") + path);
     }
-    if (g.on[0]) {
-        throw std::runtime_error("steering direction for layer 0 is not supported: llama_adapter_cvec has no layer 0");
-    }
-    if (!cvec.apply(model, dirs.data() + n_embd, (n_layer - 1)*n_embd, (int32_t) n_embd, 1, (int32_t) n_layer - 1)) {
-        throw std::runtime_error("failed to set steering vectors");
-    }
-    g.attn = env("BENCH_STEER_ATTN");
-    g.ffn = env("BENCH_STEER_FFN");
-    g.resid = env("BENCH_STEER_RESID");
-    g.active = true;
-    fprintf(stderr, "BENCHSTEER %s: %zu of %zu layers, attn=%g ffn=%g resid=%g\n", path, n_on, n_layer, g.attn, g.ffn, g.resid);
+    LLAMA_LOG_INFO("%s: %s attn=%g ffn=%g resid=%g\n", __func__, path, cvec.steer_attn, cvec.steer_ffn, cvec.steer_resid);
 }
 
 llama_context::llama_context(
@@ -238,7 +212,7 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
-    bench_steer_load(model, *cvec);
+    steer_load_env(model, *cvec);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1727,6 +1701,22 @@ bool llama_context::set_adapter_cvec(
 
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
 
+    sched_need_reserve = true;
+
+    return res;
+}
+
+bool llama_context::set_adapter_steering(
+            const float * data,
+                 size_t   len,
+                  float   attn,
+                  float   ffn,
+                  float   resid) {
+    synchronize();
+
+    const bool res = cvec->apply_steering(model, data, len, attn, ffn, resid);
+
+    // the steering nodes change the graph
     sched_need_reserve = true;
 
     return res;
@@ -4701,6 +4691,16 @@ int32_t llama_set_adapters_lora(
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
+}
+
+int32_t llama_set_adapter_steering(
+        llama_context * ctx,
+          const float * data,
+               size_t   len,
+                float   attn,
+                float   ffn,
+                float   resid) {
+    return ctx->set_adapter_steering(data, len, attn, ffn, resid) ? 0 : -1;
 }
 
 int32_t llama_set_adapter_cvec(

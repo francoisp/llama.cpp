@@ -31,6 +31,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_GET_STEERING,
+    SERVER_TASK_TYPE_SET_STEERING,
     SERVER_TASK_TYPE_TTS,
 };
 
@@ -240,6 +242,16 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_SET_STEERING
+    struct set_steering_params {
+        std::string file; // empty to unload
+        float attn  = 0.0f;
+        float ffn   = 0.0f;
+        float resid = 0.0f;
+        bool  clear_cache = false;
+    };
+    set_steering_params set_steering;
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
@@ -681,6 +693,14 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+struct server_task_result_steering : server_task_result {
+    json state;
+
+    virtual json to_json() override {
+        return state;
+    }
 };
 
 struct server_prompt {

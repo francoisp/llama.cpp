@@ -30,6 +30,67 @@ ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur
     return cur;
 }
 
+ggml_tensor * llama_adapter_cvec::steer_dir(int il, float scale) const {
+    if (!steer || scale == 0.0f || il < 0 || (size_t) il >= steer_on.size() || !steer_on[il]) {
+        return nullptr;
+    }
+
+    return tensor_for(il);
+}
+
+bool llama_adapter_cvec::apply_steering(
+        const llama_model & model,
+        const float * data,
+        size_t len,
+        float attn,
+        float ffn,
+        float resid) {
+    if (data == nullptr) {
+        steer = false;
+        steer_on.clear();
+        steer_attn = steer_ffn = steer_resid = 0.0f;
+        return apply(model, nullptr, 0, 0, -1, -1);
+    }
+
+    const size_t n_layer = model.hparams.n_layer();
+    const size_t n_embd  = model.hparams.n_embd;
+
+    if (model.arch != LLM_ARCH_DEEPSEEK41) {
+        LLAMA_LOG_ERROR("%s: directional steering needs a DeepSeek V4.1 model\n", __func__);
+        return false;
+    }
+
+    if (len != n_layer*n_embd) {
+        LLAMA_LOG_ERROR("%s: expected %zu values, got %zu\n", __func__, n_layer*n_embd, len);
+        return false;
+    }
+
+    std::vector<char> on(n_layer, 0);
+    for (size_t il = 0; il < n_layer; il++) {
+        for (size_t i = 0; i < n_embd && !on[il]; i++) {
+            on[il] = data[il*n_embd + i] != 0.0f;
+        }
+    }
+
+    // the control vector tensors have no layer 0
+    if (on[0]) {
+        LLAMA_LOG_ERROR("%s: a direction for layer 0 is not supported\n", __func__);
+        return false;
+    }
+
+    if (!apply(model, data + n_embd, len - n_embd, (int32_t) n_embd, 1, (int32_t) n_layer - 1)) {
+        return false;
+    }
+
+    steer_on    = std::move(on);
+    steer_attn  = attn;
+    steer_ffn   = ffn;
+    steer_resid = resid;
+    steer       = true;
+
+    return true;
+}
+
 bool llama_adapter_cvec::init(const llama_model & model) {
     const auto & hparams = model.hparams;
 

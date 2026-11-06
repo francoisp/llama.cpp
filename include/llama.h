@@ -747,6 +747,21 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Set directional steering, or clear it if data is NULL. DeepSeek V4.1 only.
+    // data is n_layer x n_embd F32 starting from layer 0, len the number of floats.
+    // Each direction is projected out with y -= scale * d * dot(d, y) at the attention
+    // output (attn), the FFN output (ffn) and the residual after each layer (resid).
+    // Can be called between decodes; the next decode rebuilds the graphs. Tokens already
+    // in the memory keep the steering they were decoded with.
+    // Returns 0 on success; on failure the current steering stays unchanged.
+    LLAMA_API int32_t llama_set_adapter_steering(
+            struct llama_context * ctx,
+                     const float * data,
+                          size_t   len,
+                           float   attn,
+                           float   ffn,
+                           float   resid);
+
     //
     // Memory
     //
