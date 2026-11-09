@@ -561,6 +561,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             GGML_ASSERT(!pick_blk || cand_pin->ne[0] == n_blk);
             GGML_ASSERT(!use_blk  || cand_n_comp == n_comp);
 
+            // past the candidate budget, score only the keys of the source's blocks instead of masking a dense pass:
+            // same scores for those keys, the rest were -inf (env LLAMA_DSV41_CAND_SCORING=0 restores the dense pass)
+            static const bool cand_env = !getenv("LLAMA_DSV41_CAND_SCORING") || atoi(getenv("LLAMA_DSV41_CAND_SCORING")) != 0;
+            const bool cand_only = use_blk && fused_idx && cand_env && chunk == n_tok &&
+                n_blk > (int64_t) hparams.dsv41_cand_topk_blocks && n_comp <= (INT64_C(1) << 24);
+
             ggml_tensor * ik_p = fused_idx ? nullptr : ggml_permute(ctx0, ik, 0, 2, 1, 3);
             std::vector<ggml_tensor *> parts_top_k;
             std::vector<ggml_tensor *> parts_sel;
@@ -569,6 +575,29 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 const auto rows = [&](ggml_tensor * t) {
                     return ggml_view_4d(ctx0, t, t->ne[0], nc, 1, n_stream, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]);
                 };
+                if (cand_only) {
+                    ggml_tensor * bsel = ggml_is_contiguous(cand_sel) ? cand_sel : ggml_cont(ctx0, cand_sel);
+                    const int64_t k_b  = bsel->ne[0];
+                    const int64_t n_r  = nc*n_stream;
+
+                    ggml_tensor * sc = ggml_lightning_indexer_cand(ctx0, iq, ik, iw, ci.kq_mask, bsel, (int) bs);
+                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
+                    cb(sc, "idx_score_cand", il);
+                    ggml_tensor * loc = ggml_top_k(ctx0, sc, std::min<int64_t>(k_b*bs, hparams.indexer_top_k));
+                    const int64_t k_top = loc->ne[0];
+
+                    // key id of each candidate slot (exact in F32), then the ids of the picked slots
+                    ggml_tensor * kid = ggml_scale(ctx0, ggml_cast(ctx0, bsel, GGML_TYPE_F32), (float) bs);
+                    kid = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, kid, 1, k_b, n_r, 1), bs, k_b, n_r, 1);
+                    kid = ggml_add(ctx0, kid, ggml_arange(ctx0, 0.0f, (float) bs, 1.0f));
+                    kid = ggml_reshape_3d(ctx0, kid, 1, bs*k_b, n_r);
+                    ggml_tensor * pick = ggml_get_rows(ctx0, kid, ggml_reshape_2d(ctx0, loc, k_top, n_r));
+                    pick = ggml_reshape_4d(ctx0, ggml_cast(ctx0, pick, GGML_TYPE_I32), k_top, nc, 1, n_stream);
+                    cb(pick, "idx_top_k_cand", il);
+                    parts_top_k.push_back(pick);
+                    continue;
+                }
+
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
                     score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);

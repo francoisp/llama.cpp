@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_LIGHTNING_INDEXER_CAND,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2718,6 +2719,23 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // lightning indexer restricted to candidate blocks: only the keys of the blocks each row picked are scored
+    //
+    // q, k, weights, mask: as ggml_lightning_indexer
+    // cand:    [n_cand,            n_batch, 1, ne3] i32, block ids of each row, block b holds keys [b*block_size, (b + 1)*block_size)
+    // res:     [n_cand*block_size, n_batch, 1, ne3]
+    //
+    // res[j, t] = lightning_indexer(...)[cand[j/block_size, t]*block_size + j%block_size, t], -inf for keys past n_kv
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_cand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * cand,
+        int                   block_size);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
