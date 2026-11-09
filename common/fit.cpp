@@ -64,7 +64,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool weights_if_no_ctx = false) {
     common_fit_log_scope log_scope(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -77,7 +78,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
-    if (ctx == nullptr) {
+    if (ctx == nullptr && !weights_if_no_ctx) {
         llama_model_free(model);
         throw std::runtime_error("failed to create llama_context from model");
     }
@@ -85,7 +86,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
 
-    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+    // a model that needs another context (a DFlash/DSpark draft) still has weights worth counting,
+    // its own KV cache and compute buffers are small next to the fit margin
+    llama_memory_breakdown memory_breakdown = ctx ? llama_get_memory_breakdown(ctx) : llama_model_get_memory_breakdown(model);
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
@@ -158,9 +161,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
-    common_memory_breakdown_print(ctx);
-
-    llama_free(ctx);
+    if (ctx) {
+        common_memory_breakdown_print(ctx);
+        llama_free(ctx);
+    }
     llama_model_free(model);
 
     return ret;
@@ -308,7 +312,8 @@ static void common_params_fit_impl(
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level,
+                    /*weights_if_no_ctx =*/ true);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());

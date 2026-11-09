@@ -4201,6 +4201,14 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
 }
 
+llama_memory_breakdown llama_model_get_memory_breakdown(const struct llama_model * model) {
+    llama_memory_breakdown ret;
+    for (const auto & [buft, size] : model->memory_breakdown()) {
+        ret[buft].model += size;
+    }
+    return ret;
+}
+
 // read rows [row0, row0 + n_rows) of a 2D tensor as F32
 static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, int64_t n_rows, float * out) {
     const size_t   nelements = (size_t) n_rows * tensor->ne[0];
