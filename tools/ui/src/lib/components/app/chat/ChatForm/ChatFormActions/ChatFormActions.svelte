@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { SkipForward, Square } from '@lucide/svelte';
-	import { page } from '$app/state';
 	import {
 		ChatFormActionReasoning,
 		ChatFormActionRecord,
@@ -13,10 +12,11 @@
 	import { Button } from '$lib/components/ui/button';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { setChatFormActionsContext } from '$lib/contexts';
-	import { FileTypeCategory, MessageRole } from '$lib/enums';
+	import { FileTypeCategory } from '$lib/enums';
 	import { useChatFormModel } from '$lib/hooks/use-chat-form-model.svelte';
+	import { useShowContextGauge } from '$lib/hooks/use-context-gauge.svelte';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
+	import { conversationsStore, deviceStore, settingsStore } from '$lib/stores';
 	import { getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -26,6 +26,8 @@
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
+		/** Why the microphone can't record, shown on its button. */
+		micWarning?: string | null;
 		showAddButton?: boolean;
 		showModelSelector?: boolean;
 		uploadedFiles?: ChatUploadedFile[];
@@ -33,6 +35,7 @@
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
+		onWorkingDirectoryClick?: () => void;
 	}
 
 	let {
@@ -42,10 +45,12 @@
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
+		micWarning = null,
 		onFileUpload,
 		onMicClick,
 		onStop,
 		onSystemPromptClick,
+		onWorkingDirectoryClick,
 		showAddButton = true,
 		showModelSelector = true,
 		uploadedFiles = []
@@ -86,45 +91,7 @@
 		conversationsStore.activeMessages[conversationsStore.activeMessages.length - 1]
 	);
 
-	let hasProcessedTokens = $derived.by(() => {
-		if (!page.params.id) return false;
-
-		const messages = conversationsStore.activeMessages as DatabaseMessage[];
-
-		let totalHistoricalTokens = 0;
-
-		for (const m of messages) {
-			if (m.role !== MessageRole.ASSISTANT) continue;
-
-			const timings = m.timings;
-
-			if (!timings) continue;
-
-			const agenticLlm = timings.agentic?.llm;
-
-			if (agenticLlm?.prompt_n != null || agenticLlm?.predicted_n != null) {
-				totalHistoricalTokens += (agenticLlm?.prompt_n ?? 0) + (agenticLlm?.predicted_n ?? 0);
-			} else {
-				totalHistoricalTokens += (timings.prompt_n ?? 0) + (timings.predicted_n ?? 0);
-			}
-		}
-
-		if (totalHistoricalTokens > 0) return true;
-
-		if (!chatStore.isLoading && !chatStore.isStreaming()) return false;
-
-		const processingState = chatStore.processing.activeState;
-
-		if (!processingState) return false;
-
-		const livePromptTokens = Math.max(
-			processingState.promptTokens ?? 0,
-			processingState.promptProgress?.processed ?? 0
-		);
-		const liveOutputTokens = processingState.outputTokensUsed ?? 0;
-
-		return livePromptTokens > 0 || liveOutputTokens > 0;
-	});
+	const showContextGauge = useShowContextGauge();
 
 	setChatFormActionsContext({
 		get disabled() {
@@ -144,6 +111,9 @@
 		},
 		get onSystemPromptClick() {
 			return onSystemPromptClick;
+		},
+		get onWorkingDirectoryClick() {
+			return onWorkingDirectoryClick;
 		}
 	});
 </script>
@@ -159,7 +129,8 @@
 	{/if}
 
 	<div class="flex items-center gap-1.5">
-		{#if hasProcessedTokens}
+		<!-- a phone shows the gauge pinned to the chat screen's top right instead -->
+		{#if showContextGauge.current && !deviceStore.isMobile}
 			<ChatFormContextGauge />
 		{/if}
 
@@ -208,7 +179,14 @@
 			/>
 		</Button>
 	{:else if shouldShowRecordButton}
-		<ChatFormActionRecord {disabled} {hasAudioModality} {isLoading} {isRecording} {onMicClick} />
+		<ChatFormActionRecord
+			{disabled}
+			{hasAudioModality}
+			{isLoading}
+			{isRecording}
+			{micWarning}
+			{onMicClick}
+		/>
 	{:else}
 		<ChatFormActionSubmit
 			canSend={canSend && (showModelSelector ? hasModelSelected && isSelectedModelInCache : true)}

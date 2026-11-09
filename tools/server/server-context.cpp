@@ -3590,13 +3590,19 @@ private:
     }
 
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
-        for (auto & slot : slots) {
-            try {
-                callback(slot);
-            } catch (const std::exception & e) {
-                SLT_ERR(slot, "got exception: %s\n", e.what());
-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot.release();
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto & slot : slots) {
+                const bool is_child = slot.is_processing() && slot.task->is_child();
+                if (is_child != (pass == 1)) {
+                    continue;
+                }
+                try {
+                    callback(slot);
+                } catch (const std::exception & e) {
+                    SLT_ERR(slot, "got exception: %s\n", e.what());
+                    send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                }
             }
         }
     }
@@ -4180,6 +4186,7 @@ private:
                 // check if this is a child slot
                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
+                    SLT_DBG(slot, "%s", "__TEST_TAG_WAIT_PARENT_SLOT__\n");
                     return;
                 }
 
@@ -6652,7 +6659,7 @@ void server_routes::init_routes() {
                 body[k] = std::stoll(body[k].get<std::string>());
             }
         }
-        for (const char * k : { "top_p", "repeat_penalty" }) {
+        for (const char * k : { "top_p", "temperature", "repeat_penalty" }) {
             if (body.contains(k) && body[k].is_string()) {
                 body[k] = std::stof(body[k].get<std::string>());
             }
@@ -6699,6 +6706,9 @@ void server_routes::init_routes() {
         }
         if (task.tts_inp.data.top_p > 0) {
             task.params.sampling.top_p = task.tts_inp.data.top_p;
+        }
+        if (task.tts_inp.data.temp >= 0) {
+            task.params.sampling.temp = task.tts_inp.data.temp;
         }
 
         // speaker reference: either an uploaded form file ("speaker_ref") or a base64 JSON field ("speaker_ref_b64")
