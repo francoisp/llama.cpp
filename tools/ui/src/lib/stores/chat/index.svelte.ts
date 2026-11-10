@@ -530,6 +530,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (hasValue(currentConfig.backend_sampling))
 			apiOptions.backend_sampling = currentConfig.backend_sampling;
 
+		if (hasValue(currentConfig.speculative)) apiOptions.speculative = currentConfig.speculative;
+
 		if (currentConfig.customJson) apiOptions.custom = currentConfig.customJson;
 
 		return apiOptions;

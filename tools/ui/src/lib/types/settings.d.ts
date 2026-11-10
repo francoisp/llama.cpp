@@ -118,6 +118,8 @@ export interface SettingsChatServiceOptions {
 	// Sampler configuration
 	samplers?: string | string[];
 	backend_sampling?: boolean;
+	// Use the server's draft model (speculative decoding)
+	speculative?: boolean;
 	// Custom JSON parameters
 	customJson?: string;
 	timings_per_token?: boolean;

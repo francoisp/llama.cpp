@@ -358,6 +358,7 @@ export interface ApiChatCompletionRequest {
 	// Sampler configuration
 	samplers?: string[];
 	backend_sampling?: boolean;
+	speculative?: boolean;
 	// Custom parameters (JSON string)
 	custom?: Record<string, unknown>;
 	timings_per_token?: boolean;
