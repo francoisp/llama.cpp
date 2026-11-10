@@ -651,7 +651,17 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 return v[0];
             };
             if (pick_blk) {
-                cand_sel    = join(parts_sel);
+                // ggml_top_k returns the blocks in no fixed order, and the candidate scoring keeps the first of tied
+                // keys in that order: sort the blocks so ties go to the lowest key, as in the dense pass
+                GGML_ASSERT(n_blk <= (INT64_C(1) << 24)); // block ids are exact in F32
+                ggml_tensor * blk = join(parts_sel);
+                const int64_t k_b = blk->ne[0];
+                const int64_t n_r = blk->ne[1]*blk->ne[2]*blk->ne[3];
+                ggml_tensor * ids = ggml_reshape_2d(ctx0, ggml_cont(ctx0, blk), k_b, n_r);
+                ggml_tensor * ord = ggml_argsort(ctx0, ggml_cast(ctx0, ids, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
+                cand_sel = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ids, 1, k_b, n_r), ord),
+                        k_b, blk->ne[1], blk->ne[2], blk->ne[3]);
+                cb(cand_sel, "cand_blocks_sorted", il);
                 cand_n_comp = n_comp;
             }
             top_k = ggml_cont(ctx0, join(parts_top_k));
