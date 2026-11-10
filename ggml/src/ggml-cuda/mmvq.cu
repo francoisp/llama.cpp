@@ -587,6 +587,11 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
             return true;
         default:
             return false;
@@ -1161,10 +1166,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
         };
 
         const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
+        const bool is_nvidia_ampere_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
         if (is_nvidia_turing_plus) {
-            if (ncols_dst == 1 &&
+            if (ncols_dst == 1 && !is_nvidia_ampere_plus &&
                     std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
                 use = false;
             }

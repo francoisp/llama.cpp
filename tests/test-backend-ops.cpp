@@ -13566,6 +13566,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // deepseek-v4.1-flash UD-IQ2_XXS experts (384, fewer here to keep CPU quantization short), 6 used, gate/up 5120 -> 2304, down 2304 -> 5120
+    for (int bs : {1, 4}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 24, 6, false, 2304, bs, 5120));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 24, 6, false, 5120, bs, 2304));
+        }
+    }
+    // prefill ubatches of 128 tokens over 384 experts put about 2 tokens on each expert: 32 tokens over 96 here
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 96, 6, false, 2304, 32, 5120));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 96, 6, false, 5120, 32, 2304));
+    }
+
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
