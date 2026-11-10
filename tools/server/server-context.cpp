@@ -569,6 +569,9 @@ struct server_slot {
         return !!spec;
     }
 
+    // the drafter was paused by an earlier task, resume it once the prompt cache is truncated
+    bool spec_resume = false;
+
     // experimental: skip the drafter while it does not pay (env BENCH_SPEC_GATE = tokens per cycle to break even)
     float spec_gate_ewma    = 4.0f; // tokens per verify cycle
     int   spec_gate_skip    = 0;    // plain cycles left before the next probe
@@ -608,7 +611,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate()) {
+        if (!can_speculate() || !task->params.spec_enabled) {
             return 0;
         }
 
@@ -4522,6 +4525,14 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // a task without speculative decoding pauses the drafter, the next one with it resumes it
+                        if (slot.can_speculate()) {
+                            if (!slot.task->params.spec_enabled) {
+                                common_speculative_pause(slot.spec, slot.id);
+                            }
+                            slot.spec_resume = slot.task->params.spec_enabled && common_speculative_is_paused(slot.spec, slot.id);
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4551,6 +4562,13 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    if (slot.spec_resume) {
+                        slot.spec_resume = false;
+                        if (!common_speculative_resume(slot.spec, slot.id, p0)) {
+                            SLT_ERR(slot, "%s", "failed to resume speculative decoding, drafts may degrade\n");
+                        }
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -5052,7 +5070,7 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
+                if (slot.can_speculate() && slot.task->params.spec_enabled) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {

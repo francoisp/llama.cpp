@@ -215,6 +215,11 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) the caller stops drafting for seq_id: an implementation may then skip its per-batch work for it,
+    // keeping what it needs to catch up in resume() with the positions before pos_next
+    virtual void pause(llama_seq_id /*seq_id*/) {}
+    virtual bool resume(llama_seq_id /*seq_id*/, llama_pos /*pos_next*/) { return true; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1030,6 +1035,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
 
+    // paused seqs: a draft with an attention window only reads the target features of the last n_swa_dft positions,
+    // so process() keeps those instead of injecting every batch, and resume() injects them in one batch.
+    // The injected K of a position depends on its features only, so the draft cache ends up as if it was never paused.
+    int32_t                             n_swa_dft = 0; // 0: no window, a paused seq keeps being injected
+    int32_t                             n_keep    = 0; // positions kept per paused seq, slot = pos % n_keep
+    std::vector<bool>                   paused;
+    std::vector<std::vector<float>>     kept_feat;     // [n_keep, n_embd_enc] per seq
+    std::vector<std::vector<llama_pos>> kept_pos;      // position held by each slot, -1 if none
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1161,6 +1175,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_INF("%s: DFlash target features via %s\n", __func__, use_dev_features ? "device buffer" : "host copies");
         }
 
+        // DFlash2 and LiliCorr keep state beyond the draft cache, they are injected while paused
+        n_swa_dft = !is_dflash2 && !is_lilicorr ? llama_model_n_swa(model_dft) : 0;
+        n_keep    = 2*n_swa_dft;
+        paused.assign(n_seq, false);
+        kept_feat.resize(n_seq);
+        kept_pos.resize(n_seq);
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1199,6 +1220,113 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    void pause(llama_seq_id seq_id) override {
+        if (n_swa_dft <= 0 || seq_id < 0 || seq_id >= (llama_seq_id) n_seq || paused[seq_id]) {
+            return;
+        }
+
+        paused[seq_id] = true;
+        kept_feat[seq_id].resize((size_t) n_keep * n_embd_enc);
+        kept_pos[seq_id].assign(n_keep, -1);
+    }
+
+    bool resume(llama_seq_id seq_id, llama_pos pos_next) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !paused[seq_id]) {
+            return true;
+        }
+
+        paused[seq_id] = false;
+
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        // the window before pos_next, minus what the draft cache already holds
+        const llama_pos pos_dft = llama_memory_seq_pos_max(mem_dft, seq_id);
+        const llama_pos p0      = std::max<llama_pos>(pos_next - n_swa_dft, pos_dft + 1);
+
+        const auto & feat = kept_feat[seq_id];
+        const auto & kpos = kept_pos[seq_id];
+
+        // the newest run of consecutive kept positions before pos_next
+        std::vector<llama_pos> todo;
+        for (llama_pos p = pos_next - 1; p >= p0 && kpos[p % n_keep] == p; --p) {
+            todo.push_back(p);
+        }
+        std::reverse(todo.begin(), todo.end());
+
+        // the draft cache takes consecutive positions only: past a gap, drop the older positions, the window does not reach them
+        const llama_pos p_start = todo.empty() ? pos_next : todo.front();
+        if (p_start > pos_dft + 1) {
+            llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+        }
+
+        LOG_INF("%s: seq %d resumes at pos %d, injecting %zu of %d positions%s\n", __func__,
+                (int) seq_id, (int) pos_next, todo.size(), (int) std::max<llama_pos>(pos_next - p0, 0),
+                p_start > pos_dft + 1 && pos_dft >= 0 ? " (older draft positions dropped)" : "");
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        for (size_t offset = 0; offset < todo.size(); offset += n_ubatch) {
+            const size_t n_chunk = std::min(todo.size() - offset, (size_t) n_ubatch);
+
+            batch_inject.clear();
+            for (size_t i = 0; i < n_chunk; ++i) {
+                const llama_pos p          = todo[offset + i];
+                const llama_pos pos_arr[4] = { p, p, p, 0 };
+                batch_inject.add_embd({ feat.data() + (size_t) (p % n_keep) * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+            }
+
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+            if (rc != 0) {
+                LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%zu)\n", __func__, rc, n_chunk);
+                // start the draft cache over at the next batch, the drafts recover as the window refills
+                llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // keep the features of the last positions of a paused seq, the older rows of the batch cannot be in the window
+    bool keep_features(const common_batch & batch_in, llama_seq_id seq_id, int32_t i_beg, int32_t n_rows) {
+        const int32_t n_take = std::min(n_rows, n_keep);
+        const int32_t i0     = i_beg + n_rows - n_take;
+
+        features_buf.resize((size_t) n_take * n_embd_enc);
+
+        if (use_dev_features) {
+            // device rows hold the layers in ascending id order, which is target_layer_ids order here
+            if (!llama_get_embeddings_layer_inp_dev_rows(this->params.ctx_tgt, i0, n_take, features_buf.data())) {
+                LOG_ERR("%s: cannot read the target layer input rows [%d, %d)\n", __func__, i0, i0 + n_take);
+                return false;
+            }
+        } else {
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(this->params.ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+                for (int32_t i = 0; i < n_take; ++i) {
+                    std::memcpy(features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt,
+                            layer + (size_t) (i0 + i) * n_embd_tgt, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+        }
+
+        auto & feat = kept_feat[seq_id];
+        auto & kpos = kept_pos[seq_id];
+
+        for (int32_t i = 0; i < n_take; ++i) {
+            const llama_pos p    = batch_in.tokens[i0 + i].pos[0];
+            const int32_t   slot = p % n_keep;
+            std::memcpy(feat.data() + (size_t) slot * n_embd_enc, features_buf.data() + (size_t) i * n_embd_enc, (size_t) n_embd_enc * sizeof(float));
+            kpos[slot] = p;
+        }
+
+        return true;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -1247,6 +1375,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // cache cannot free cells for it - skip it, the draft can jump over the gap
             const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
+                continue;
+            }
+
+            if (paused[seq_id]) {
+                if (!keep_features(batch_in, seq_id, i_batch_beg[seq_id], n_rows)) {
+                    return false;
+                }
                 continue;
             }
 
@@ -2490,6 +2625,9 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // seqs the caller does not draft for, see common_speculative_pause()
+    std::vector<bool> paused;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3026,6 +3164,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .paused      = */ std::vector<bool>(n_seq, false),
     });
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -3097,6 +3236,37 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+void common_speculative_pause(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->paused.size()) {
+        return;
+    }
+
+    spec->paused[seq_id] = true;
+
+    for (auto & impl : spec->impls) {
+        impl->pause(seq_id);
+    }
+}
+
+bool common_speculative_resume(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_next) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->paused.size() || !spec->paused[seq_id]) {
+        return true;
+    }
+
+    spec->paused[seq_id] = false;
+
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        result = impl->resume(seq_id, pos_next) && result;
+    }
+
+    return result;
+}
+
+bool common_speculative_is_paused(const common_speculative * spec, llama_seq_id seq_id) {
+    return spec != nullptr && seq_id >= 0 && seq_id < (llama_seq_id) spec->paused.size() && spec->paused[seq_id];
 }
 
 void common_speculative_draft(common_speculative * spec) {

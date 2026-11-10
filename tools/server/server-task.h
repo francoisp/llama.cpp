@@ -104,6 +104,7 @@ struct task_params {
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
+    bool spec_enabled = true; // draft for this task, when the server has speculative decoding
 
     // response formatting
     bool               verbose  = false;

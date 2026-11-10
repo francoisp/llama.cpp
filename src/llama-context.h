@@ -94,6 +94,9 @@ struct llama_context {
     float * get_embeddings_layer_inp(uint32_t lid);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
+
+    // copy rows of the layer input device buffer to host memory, false without the device buffer
+    bool get_layer_inp_dev_rows(int32_t i0, int32_t n_rows, float * dst);
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
     llama_token * get_sampled_tokens() const;

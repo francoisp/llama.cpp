@@ -599,6 +599,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `return_tokens`: Return the raw generated token ids in the `tokens` field. Otherwise `tokens` remains empty. Default: `false`
 
+`speculative`: Use the server's speculative decoding for this request, if it was started with one. With `false` the request generates one token at a time, and a DSpark draft model (`--spec-type draft-dspark`) also skips its per-token work: when a later request turns it back on, the draft model catches up from the last positions of the cached prompt. Default: `true`
+
 `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]` - these are all the available values.
 
 `timings_per_token`: Include prompt processing and text generation speed information in each response.  Default: `false`

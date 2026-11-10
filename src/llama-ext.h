@@ -171,6 +171,10 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 // Row r holds the token at batch index r, layers in ascending layer id order.
 LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
 
+// Copy rows [i0, i0 + n_rows) of the layer input device buffer to dst, n_rows*n_layer_inp*n_embd floats in the row layout above.
+// Waits for the last decode to write them. Returns false when the context does not use the device buffer.
+LLAMA_API bool llama_get_embeddings_layer_inp_dev_rows(struct llama_context * ctx, int32_t i0, int32_t n_rows, float * dst);
+
 // Whether decode accepts entries added with llama_batch_ext_add_embd_row()
 // (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
 LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);

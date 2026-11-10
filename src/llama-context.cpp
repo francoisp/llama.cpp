@@ -1262,6 +1262,24 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+bool llama_context::get_layer_inp_dev_rows(int32_t i0, int32_t n_rows, float * dst) {
+    if (layer_inp_dev == nullptr || i0 < 0 || n_rows <= 0 || i0 + n_rows > layer_inp_dev->ne[1]) {
+        return false;
+    }
+
+    // the rows are complete once the decode that wrote them has finished on the buffer's device
+    if (ev_layer_inp_written) {
+        ggml_backend_event_synchronize(ev_layer_inp_written.get());
+    } else {
+        synchronize();
+    }
+
+    const size_t row_size = layer_inp_dev->nb[1];
+    ggml_backend_tensor_get(layer_inp_dev, dst, (size_t) i0*row_size, (size_t) n_rows*row_size);
+
+    return true;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -4811,6 +4829,10 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+bool llama_get_embeddings_layer_inp_dev_rows(llama_context * ctx, int32_t i0, int32_t n_rows, float * dst) {
+    return ctx->get_layer_inp_dev_rows(i0, n_rows, dst);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

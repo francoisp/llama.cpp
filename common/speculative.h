@@ -92,6 +92,16 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// stop drafting for seq_id: the caller must not request drafts for it until it resumes
+// implementations that can (DSpark) then skip their per-batch work for it and keep only what resuming needs
+void common_speculative_pause(common_speculative * spec, llama_seq_id seq_id);
+
+// draft again for seq_id after the caller has processed the positions before pos_next, catching up with them
+// call it after removing any positions >= pos_next from both contexts; returns false on failure
+bool common_speculative_resume(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_next);
+
+bool common_speculative_is_paused(const common_speculative * spec, llama_seq_id seq_id);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

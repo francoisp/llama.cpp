@@ -228,6 +228,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
 #endif
 
+    add((new field_bool("speculative", params.spec_enabled))
+        ->set_desc("Use the server's speculative decoding for this request. When off, a DSpark draft model also skips its per-token work and catches up when a later request turns it back on"));
+
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
