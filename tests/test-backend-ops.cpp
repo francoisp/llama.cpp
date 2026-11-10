@@ -12482,6 +12482,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // rows contiguous in dim 0 but strided above it, 16-byte aligned: CUDA copies them a row per warp
+    for (int v : { 1, 2, 3 }) {
+        for (int dim : { 1, 2, 3 }) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {512, 3, 5, 2}, 4, dim, v));
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {64, 3, 5, 2}, 4, dim, v));
+        }
+    }
+
     // few long rows, which backends may split across workgroups
     for (int dim : { 0, 1 }) {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));

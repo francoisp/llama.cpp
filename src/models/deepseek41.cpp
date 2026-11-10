@@ -745,6 +745,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, 0, kq_scale, il);
         } else {
             // dense attention over [window | all compressed rows], selection applied as a mask
+            static const bool comp_k_view_env = !getenv("LLAMA_DSV41_COMP_K_VIEW") || atoi(getenv("LLAMA_DSV41_COMP_K_VIEW")) != 0;
             ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
                     comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], 0);
             if (k_rot) {
@@ -757,9 +758,14 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             } else if (ggml_is_quantized(comp_k->type)) {
                 // quantized cache without rotation (LLAMA_ATTN_ROT_DISABLE=1): via F32 for the same reason
                 comp_k = ggml_cast(ctx0, ggml_cast(ctx0, comp_k, GGML_TYPE_F32), raw_k->type);
-            } else {
-                comp_k = comp_k->type != raw_k->type ? ggml_cast(ctx0, comp_k, raw_k->type) : ggml_cont(ctx0, comp_k);
+            } else if (comp_k->type != raw_k->type) {
+                comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
+            } else if (!comp_k_view_env || model.no_alloc()) {
+                comp_k = ggml_cont(ctx0, comp_k);
             }
+            // otherwise the concat below reads the strided rows in place: one copy instead of a cont plus a concat
+            // (env LLAMA_DSV41_COMP_K_VIEW=0 restores the cont). The --fit measurement (a no_alloc model) still
+            // sizes the cont, so the layer split and every result stay as before; the run just needs less memory.
             cb(comp_k, "comp_k", il);
             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 

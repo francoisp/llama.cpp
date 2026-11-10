@@ -79,6 +79,58 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+// rows contiguous in dim 0 but strided above it (e.g. a view of the first columns of a cache):
+// one warp copies a row with 16-byte accesses
+template <int dim>
+static __global__ void concat_rows_16(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst, int64_t n16,
+        int64_t ne01, int64_t ne02, int64_t ne03, uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb11, uint64_t nb12, uint64_t nb13,
+        int64_t ne1, int64_t ne2, int64_t ne3, uint64_t nb1, uint64_t nb2, uint64_t nb3) {
+    static_assert(dim >= 1 && dim <= 3, "dim must be in [1, 3]");
+
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= ne1*ne2*ne3) {
+        return;
+    }
+    const int64_t i1 = r % ne1;
+    const int64_t i2 = (r / ne1) % ne2;
+    const int64_t i3 = r / (ne1*ne2);
+
+    const char * s;
+    if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        s = src0 + i3*nb03 + i2*nb02 + i1*nb01;
+    } else if constexpr (dim == 1) {
+        s = src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11;
+    } else if constexpr (dim == 2) {
+        s = src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11;
+    } else {
+        s = src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11;
+    }
+    char * d = dst + i3*nb3 + i2*nb2 + i1*nb1;
+
+    for (int64_t k = threadIdx.x; k < n16; k += blockDim.x) {
+        ((int4 *) d)[k] = ((const int4 *) s)[k];
+    }
+}
+
+static bool concat_rows_16_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int dim) {
+    if (dim == 0) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(dst->type);
+    if (ggml_is_quantized(dst->type) || src0->nb[0] != ts || src1->nb[0] != ts || dst->nb[0] != ts ||
+            (dst->ne[0]*ts) % 16 != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : { src0, src1, dst }) {
+        if ((uintptr_t) t->data % 16 != 0 || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -160,6 +212,24 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (concat_rows_16_ok(src0, src1, dst, dim)) {
+        const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+        const int64_t n16    = dst->ne[0]*ggml_type_size(dst->type)/16;
+        const dim3 block_dims(32, 8, 1);
+        const dim3 grid_dims((n_rows + 7)/8, 1, 1);
+        auto launch_rows = [&](auto dim) {
+            concat_rows_16<dim><<<grid_dims, block_dims, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data, n16,
+                src0->ne[1], src0->ne[2], src0->ne[3], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->ne[1], dst->ne[2], dst->ne[3], dst->nb[1], dst->nb[2], dst->nb[3]);
+        };
+        switch (dim) {
+            case 1: launch_rows(std::integral_constant<int, 1>{}); break;
+            case 2: launch_rows(std::integral_constant<int, 2>{}); break;
+            case 3: launch_rows(std::integral_constant<int, 3>{}); break;
+            default: GGML_ABORT("Invalid dim: %d", dim);
+        }
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
