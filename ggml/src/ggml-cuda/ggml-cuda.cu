@@ -72,6 +72,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/prefix-mask.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2863,6 +2864,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_PREFIX_MASK:
+            ggml_cuda_op_prefix_mask(ctx, dst);
             break;
         default:
             return false;
@@ -6375,6 +6379,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_cand_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_PREFIX_MASK:
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                op->src[0]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[0]);
 
         default:
             return false;

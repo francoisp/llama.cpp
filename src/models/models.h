@@ -1500,6 +1500,11 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+
+        // compressed masks built on the device of their layers from the visible counts, once per device,
+        // instead of a full-length host mask uploaded to every device (env LLAMA_DSV41_DEV_MASK=0 keeps the host mask)
+        std::map<std::pair<const void *, ggml_backend_t>, ggml_tensor *> comp_mask_of;
+        ggml_tensor * comp_kq_mask(const llama_model_deepseek41 & model, const llm_graph_input_dsv4::comp_input & ci, int il);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

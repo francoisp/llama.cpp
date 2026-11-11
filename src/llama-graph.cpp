@@ -1016,6 +1016,11 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
 
+    if (inp.n_visible && inp.n_visible->buffer) {
+        GGML_ASSERT(ggml_nelements(inp.n_visible) == (int64_t) plan.n_visible.size());
+        ggml_backend_tensor_set(inp.n_visible, plan.n_visible.data(), 0, plan.n_visible.size()*sizeof(int32_t));
+    }
+
     if (debug || dsv4_compress_debug()) {
         LLAMA_LOG_INFO("%s: %s n_tokens=%u, n_stream=%d, state_persist_dst=%s, state_write_pos=%s\n",
                 __func__, name, n_tokens, (int) n_stream,
@@ -1063,6 +1068,7 @@ static bool dsv4_can_reuse_comp_input(
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_idxs, plan.state_write_idxs.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_pos, plan.state_write_pos.size());
     res &= dsv4_can_reuse_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    res &= !inp.n_visible || (plan.n_kv > 0 && inp.n_visible->ne[0] == (int64_t) n_tokens/n_stream && inp.n_visible->ne[2] == n_stream);
 
     return res;
 }
@@ -1110,6 +1116,10 @@ static void dsv4_build_comp_inputs(
         inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+
+        inp.n_visible = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_tokens/n_stream, 1, n_stream);
+        ggml_set_input(inp.n_visible);
+        ggml_set_name(inp.n_visible, (std::string("dsv4_") + name + "_n_visible").c_str());
     }
 }
 

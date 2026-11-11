@@ -9695,6 +9695,62 @@ struct test_lightning_indexer_cand : public test_case {
 };
 
 // GGML_OP_TOP_K_MASK
+// GGML_OP_PREFIX_MASK
+struct test_prefix_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t nb; // rows per stream
+    const int64_t ns; // streams
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_kv, nb, ns);
+    }
+
+    // every cell is 0 or -inf: count the cells that differ
+    double max_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+
+    test_prefix_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 1000, int64_t nb = 7, int64_t ns = 1)
+        : type(type), n_kv(n_kv), nb(nb), ns(ns) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * n_visible = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nb, 1, ns);
+        ggml_set_name(n_visible, "n_visible");
+
+        ggml_tensor * out = ggml_prefix_mask(ctx, n_visible, n_kv, type);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x5046);
+        std::uniform_int_distribution<int32_t> dis(0, (int32_t) n_kv);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                continue;
+            }
+            // edge rows: nothing visible, everything visible, out of range on both sides
+            std::vector<int32_t> data(ggml_nelements(t));
+            for (size_t i = 0; i < data.size(); ++i) {
+                const uint32_t r = gen() % 16;
+                data[i] = r == 0 ? 0 : r == 1 ? (int32_t) n_kv : r == 2 ? -3 : r == 3 ? (int32_t) n_kv + 5 : dis(gen);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 struct test_top_k_mask : public test_case {
     const ggml_type type;
     const int64_t n_kv;
@@ -10626,6 +10682,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_prefix_mask(type));
+        test_cases.emplace_back(new test_prefix_mask(type, 33, 1));
+        test_cases.emplace_back(new test_prefix_mask(type, 4100, 5, 3));
+        test_cases.emplace_back(new test_prefix_mask(type, 262272, 1));   // DeepSeek-V4.1 ratio-2 mask at 524K, decode
+        test_cases.emplace_back(new test_prefix_mask(type, 131200, 128)); // ratio-4 mask at 524K, -ub 128 prefill
+    }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)

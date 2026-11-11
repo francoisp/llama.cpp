@@ -591,6 +591,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_PREFIX_MASK,
 
         GGML_OP_UNARY,
 
@@ -2806,6 +2807,19 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // prefix attention mask: the first n_visible[i] cells of row i are visible
+    //
+    // n_visible: [ne1, ne2, ne3]       i32, contiguous
+    // res:       [n_kv, ne1, ne2, ne3] f16 or f32
+    //
+    // res[c, i] = 0 when c < n_visible[i], else -inf
+    //
+    GGML_API struct ggml_tensor * ggml_prefix_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * n_visible,
+            int64_t               n_kv,
+            enum ggml_type        type);
 
     // custom operators
 

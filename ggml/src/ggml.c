@@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "PREFIX_MASK",
 
     "UNARY",
 
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,6 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "prefix_mask(n_visible)",
 
     "unary(x)",
 
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6811,6 +6813,27 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_prefix_mask
+
+struct ggml_tensor * ggml_prefix_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * n_visible,
+        int64_t               n_kv,
+        enum ggml_type        type) {
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(n_visible->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(n_visible));
+    GGML_ASSERT(n_visible->ne[3] == 1);
+    GGML_ASSERT(n_kv > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_kv, n_visible->ne[0], n_visible->ne[1], n_visible->ne[2]);
+
+    result->op     = GGML_OP_PREFIX_MASK;
+    result->src[0] = n_visible;
 
     return result;
 }

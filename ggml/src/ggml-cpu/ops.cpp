@@ -11639,6 +11639,47 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_prefix_mask
+
+template <typename T>
+static void ggml_compute_forward_prefix_mask_impl(const ggml_compute_params * params, ggml_tensor * dst, T zero, T ninf) {
+    const int32_t * n_visible = (const int32_t *) dst->src[0]->data;
+
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t ne1    = dst->ne[1];
+    const int64_t ne2    = dst->ne[2];
+    const int64_t n_rows = ggml_nrows(dst);
+
+    for (int64_t i = params->ith; i < n_rows; i += params->nth) {
+        const int64_t i1 = i % ne1;
+        const int64_t i2 = (i / ne1) % ne2;
+        const int64_t i3 = i / (ne1*ne2);
+
+        T * row = (T *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        const int64_t n = std::min<int64_t>(std::max<int64_t>(n_visible[i], 0), n_kv);
+        std::fill(row,     row + n,    zero);
+        std::fill(row + n, row + n_kv, ninf);
+    }
+}
+
+void ggml_compute_forward_prefix_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
+
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_prefix_mask_impl<float>(params, dst, 0.0f, -INFINITY);
+            break;
+        case GGML_TYPE_F16:
+            ggml_compute_forward_prefix_mask_impl<ggml_fp16_t>(params, dst, GGML_CPU_FP32_TO_FP16(0.0f), GGML_CPU_FP32_TO_FP16(-INFINITY));
+            break;
+        default:
+            GGML_ABORT("unsupported type");
+    }
+}
+
 // ggml_compute_forward_top_k_mask
 
 void ggml_compute_forward_top_k_mask(

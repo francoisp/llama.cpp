@@ -630,6 +630,7 @@ public:
         ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+        ggml_tensor * n_visible  = nullptr; // I32 [n_batch/n_stream, 1, n_stream], kq_mask rows as counts (built on device)
 
         std::vector<ggml_tensor *> k_rot;
     };

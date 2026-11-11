@@ -406,6 +406,45 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
     return ggml_add(ctx0, x, ggml_mul(ctx0, ggml_repeat_4d(ctx0, value, n_embd, hc, nt, 1), gate));
 }
 
+ggml_tensor * llama_model_deepseek41::graph::comp_kq_mask(
+        const llama_model_deepseek41 & model,
+        const llm_graph_input_dsv4::comp_input & ci,
+        int il) {
+    static const bool dev_env = dsv41_env_on("LLAMA_DSV41_DEV_MASK");
+    if (!dev_env || !ci.kq_mask || !ci.n_visible) {
+        return ci.kq_mask;
+    }
+
+    // the backend that runs the attention of this layer
+    ggml_backend_dev_t dev     = model.dev_layer(il);
+    ggml_backend_t     backend = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(b) == dev) {
+            backend = b;
+            break;
+        }
+    }
+    if (backend == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return ci.kq_mask; // the host mask is already there
+    }
+
+    auto & mask = comp_mask_of[{ &ci, backend }];
+    if (mask == nullptr) {
+        // the same 0/-inf cells as the host mask: c < n_visible[i]
+        ggml_tensor * m = ggml_prefix_mask(ctx0, ci.n_visible, ci.kq_mask->ne[0], ci.kq_mask->type);
+        if (ggml_backend_supports_op(backend, m)) {
+            ggml_backend_sched_set_tensor_backend(sched, m, backend);
+            cb(m, "comp_kq_mask_dev", il);
+            mask = m;
+        } else {
+            mask = ci.kq_mask;
+        }
+    }
+
+    return mask;
+}
+
 ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         const llama_model_deepseek41 & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -524,6 +563,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     } else {
         const int64_t n_comp = ci.kq_mask->ne[0];
 
+        ggml_tensor * comp_mask = comp_kq_mask(model, ci, il);
+
         ggml_tensor * comp_all = comp_ctx->get_k(ctx0, rd);
         GGML_ASSERT(comp_all->ne[0] == n_embd_head + n_idx_embd && n_comp <= comp_all->ne[2]);
         const int64_t n_stream = comp_all->ne[3];
@@ -580,7 +621,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     const int64_t k_b  = bsel->ne[0];
                     const int64_t n_r  = nc*n_stream;
 
-                    ggml_tensor * sc = ggml_lightning_indexer_cand(ctx0, iq, ik, iw, ci.kq_mask, bsel, (int) bs);
+                    ggml_tensor * sc = ggml_lightning_indexer_cand(ctx0, iq, ik, iw, comp_mask, bsel, (int) bs);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
                     cb(sc, "idx_score_cand", il);
                     ggml_tensor * loc = ggml_top_k(ctx0, sc, std::min<int64_t>(k_b*bs, hparams.indexer_top_k));
@@ -600,7 +641,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
+                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_mask);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
@@ -608,7 +649,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
                     score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), rows(iw)));
-                    ggml_tensor * mask  = rows(ci.kq_mask);
+                    ggml_tensor * mask  = rows(comp_mask);
                     score = ggml_add(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)),
                             mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
                 }
@@ -746,7 +787,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // window mask, then the comp mask at the selected rows (-inf where top-k picked an invisible row); one per top-k source
             ggml_tensor *& kq_mask = gather_mask_of[topk_src];
             if (!kq_mask) {
-                ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, nt), sel);
+                ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, comp_mask, 1, n_comp, nt), sel);
                 sel_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, sel_mask, k_sel, 1, 1, nt), GGML_TYPE_F16);
                 kq_mask = ggml_concat(ctx0, ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt), sel_mask, 0);
                 cb(kq_mask, "comp_kq_mask_sel", il);
@@ -779,7 +820,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             cb(comp_k, "comp_k", il);
             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
-            ggml_tensor * sel_mask = build_top_k_mask(ci.kq_mask, top_k, "comp_top_k_mask", il);
+            ggml_tensor * sel_mask = build_top_k_mask(comp_mask, top_k, "comp_top_k_mask", il);
             ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
             cb(kq_mask, "comp_kq_mask", il);
 
