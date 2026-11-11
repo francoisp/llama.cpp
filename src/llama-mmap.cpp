@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -1064,6 +1069,83 @@ const bool llama_mlock::SUPPORTED = true;
 const bool llama_mlock::SUPPORTED = false;
 #endif
 
+#if defined(__linux__) || defined(__APPLE__)
+// madvise(MADV_WILLNEED) is one system call per range, and the rows of a lazily read table are scattered: a 256-token
+// ubatch of DeepSeek V4.1 asks for 12K Engram rows, about 100 ms of calls with every device waiting. The advice does
+// not have to be done before the caller goes on (a row that is not in memory yet is read when it is gathered), so the
+// calls run on a few background threads. Requests that are still queued when a newer one arrives are dropped: the
+// rows of an older ubatch are no longer worth reading ahead.
+struct llama_prefetch_pool {
+    static constexpr int    n_threads    = 4;
+    static constexpr size_t n_queued_max = 2*n_threads;
+
+    struct job {
+        std::shared_ptr<const llama_memory_ranges> mr;
+        size_t i0;
+        size_t i1;
+    };
+
+    std::mutex              mutex;
+    std::condition_variable cv;
+    std::deque<job>         jobs;
+    bool                    warned = false;
+
+    static llama_prefetch_pool & get() {
+        // never destroyed: the threads may still be in madvise when the process exits
+        static llama_prefetch_pool * pool = new llama_prefetch_pool();
+        return *pool;
+    }
+
+    llama_prefetch_pool() {
+        for (int i = 0; i < n_threads; ++i) {
+            std::thread([this] { run(); }).detach();
+        }
+    }
+
+    void submit(llama_memory_ranges && mr) {
+        auto shared = std::make_shared<const llama_memory_ranges>(std::move(mr));
+        const size_t n = shared->size();
+        // a few hundred ranges per job, so a large request spreads over the threads
+        const size_t n_jobs = std::min<size_t>(n_threads, (n + 255)/256);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (size_t j = 0; j < n_jobs; ++j) {
+                jobs.push_back({ shared, n*j/n_jobs, n*(j + 1)/n_jobs });
+            }
+            while (jobs.size() > n_queued_max) {
+                jobs.pop_front();
+            }
+        }
+        cv.notify_all();
+    }
+
+    void run() {
+        while (true) {
+            job j;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this] { return !jobs.empty(); });
+                j = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            for (size_t i = j.i0; i < j.i1; ++i) {
+                const auto & range = (*j.mr)[i];
+                // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
+                if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
+                    const int err = errno;
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!warned) {
+                        warned = true;
+                        LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(err));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+};
+#endif
+
 void llama_prefetch(llama_memory_ranges mr) {
 #if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
     if (mr.empty()) {
@@ -1128,13 +1210,7 @@ void llama_prefetch(llama_memory_ranges mr) {
                 llama_format_win_err(GetLastError()).c_str());
     }
 #else
-    for (const auto & range : mr) {
-        // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
-        if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
-            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
-            return;
-        }
-    }
+    llama_prefetch_pool::get().submit(std::move(mr));
 #endif
 #else
     GGML_UNUSED(mr);
