@@ -3,8 +3,8 @@
 	import {
 		ChatFormActionReasoning,
 		ChatFormActionRecord,
-		ChatFormActionSteering,
 		ChatFormActionsAdd,
+		ChatFormActionSteering,
 		ChatFormActionSubmit,
 		ChatFormContextGauge,
 		ModelsSelector
