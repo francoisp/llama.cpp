@@ -280,7 +280,15 @@
 		const fitsOneLine = height < CHAT_FORM_SINGLE_ROW_MAX_TEXT_PX;
 		const length = value.length;
 
-		if (!length) wrappedAtLength = Infinity;
+		// An empty input measures its placeholder, which can wrap in the single row (e.g. beside
+		// wide actions) and fit in two: deciding on that height flips the layout on every run of
+		// this effect, which reads the height before the switch is laid out, until Svelte aborts
+		if (!length) {
+			wrappedAtLength = Infinity;
+			isSingleRow = canBeSingleRow;
+
+			return;
+		}
 
 		if (!canBeSingleRow) {
 			isSingleRow = false;
