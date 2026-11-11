@@ -11,6 +11,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <vector>
@@ -691,6 +692,10 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tensor_buft_overrides;
     };
 
+    // with op offload, an operation on weights in system memory runs on a device that needs room to copy those weights,
+    // while filling the devices that room is counted for MoE weights that end up in device memory, see step 4
+    bool measure_op_offload = cparams->op_offload;
+
     // utility function that returns the memory use per device for given numbers of layers per device
     auto get_memory_for_layers = [&](
             const char * func_name,
@@ -699,8 +704,11 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
+        llama_context_params cparams_copy = *cparams;
+        cparams_copy.op_offload = measure_op_offload;
+
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            paths_model, &mparams_copy, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+            paths_model, &mparams_copy, &cparams_copy, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
         add_extra_memory(dmd_nl);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
@@ -842,141 +850,212 @@ static void common_params_fit_impl(
     //     convert the dense-only layers in the back to full layers in the front until all devices are full
     // essentially the same procedure as for the dense-only layers except front-to-back
     // also, try fitting at least part of one more layer to reduce waste for "small" GPUs with e.g. 24 GiB VRAM
+    //     with split_gate_up the extra layer may keep up on this device and move gate to the next one
+    const char * func_name = __func__; // for the log lines of the lambda below
+    auto fill_front_to_back = [&](const bool split_gate_up) {
 
-    size_t id_dense_start = nd;
-    for (int id = nd - 1; id >= 0; id--) {
-        if (ngl_per_device[id].n_layer > 0) {
-            id_dense_start = id;
-            continue;
+        size_t id_dense_start = nd;
+        for (int id = nd - 1; id >= 0; id--) {
+            if (ngl_per_device[id].n_layer > 0) {
+                id_dense_start = id;
+                continue;
+            }
+            break;
         }
-        break;
-    }
-    assert(id_dense_start < nd);
+        assert(id_dense_start < nd);
 
-    LOG_TRC("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", __func__);
-    for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
-        std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
-        for (size_t jd = id_dense_start; jd < nd; jd++) {
-            const uint32_t n_layer_move = jd < nd - 1 ? ngl_per_device_high[jd].n_layer : ngl_per_device_high[jd].n_layer - 1;
-            ngl_per_device_high[id].n_layer += n_layer_move;
-            ngl_per_device_high[jd].n_layer -= n_layer_move;
-            ngl_per_device_high[jd].n_part = 0;
-        }
-        size_t id_dense_start_high = nd - 1;
-        std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+        LOG_TRC("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", func_name);
+        for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
+            std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
+            for (size_t jd = id_dense_start; jd < nd; jd++) {
+                const uint32_t n_layer_move = jd < nd - 1 ? ngl_per_device_high[jd].n_layer : ngl_per_device_high[jd].n_layer - 1;
+                ngl_per_device_high[id].n_layer += n_layer_move;
+                ngl_per_device_high[jd].n_layer -= n_layer_move;
+                ngl_per_device_high[jd].n_part = 0;
+            }
+            size_t id_dense_start_high = nd - 1;
+            std::vector<int64_t> mem_high = get_memory_for_layers(func_name, ngl_per_device_high, overflow_bufts);
 
-        if (mem_high[id] > targets[id]) {
-            assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
-            uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
-            while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                step_size = std::max(step_size, uint32_t(1));
-                step_size = std::min(step_size, delta - 1);
-
-                std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-                size_t id_dense_start_test = id_dense_start;
-                uint32_t n_converted_test = 0;
-                for (;id_dense_start_test < nd; id_dense_start_test++) {
-                    const uint32_t n_convert_jd = std::min(step_size - n_converted_test, ngl_per_device_test[id_dense_start_test].n_part);
-                    ngl_per_device_test[id_dense_start_test].n_layer -= n_convert_jd;
-                    ngl_per_device_test[id_dense_start_test].n_part -= n_convert_jd;
-                    ngl_per_device_test[id].n_layer += n_convert_jd;
-                    n_converted_test += n_convert_jd;
-
-                    if (ngl_per_device_test[id_dense_start_test].n_part > 0) {
-                        break;
-                    }
-                }
-                const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
-
-                if (mem_test[id] <= targets[id]) {
-                    ngl_per_device = ngl_per_device_test;
-                    mem            = mem_test;
-                    id_dense_start = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
-                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
-                } else {
-                    ngl_per_device_high = ngl_per_device_test;
-                    mem_high            = mem_test;
-                    id_dense_start_high = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start_high=%zu\n",
-                        __func__, id, ngl_per_device_high[id].n_layer, ngl_per_device_high[id].n_part, id_dense_start_high);
-                }
+            if (mem_high[id] > targets[id]) {
                 assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
-                delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
-            }
-        } else {
-            ngl_per_device = ngl_per_device_high;
-            mem            = mem_high;
-            id_dense_start = id_dense_start_high;
-            LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
-                __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
-        }
+                uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
+                while (delta > 1) {
+                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                    step_size = std::max(step_size, uint32_t(1));
+                    step_size = std::min(step_size, delta - 1);
 
-        // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
-            std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-            size_t id_dense_start_test = id_dense_start;
-            ngl_per_device_test[id_dense_start_test].n_layer--;
-            ngl_per_device_test[id_dense_start_test].n_part--;
-            ngl_per_device_test[id].n_layer++;
-            ngl_per_device_test[id].n_part++;
-            if (ngl_per_device_test[id_dense_start_test].n_part == 0) {
-                id_dense_start_test++;
-            }
-            ngl_per_device_test[id].overflow_type = LAYER_FRACTION_UP;
-            std::vector<ggml_backend_buffer_type_t> overflow_bufts_test = overflow_bufts;
-            if (id < nd - 1) {
-                overflow_bufts_test[id] = ggml_backend_dev_buffer_type(devs[id + 1]);
-            }
-            LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
-            std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-            if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
-                ngl_per_device = ngl_per_device_test;
-                overflow_bufts = overflow_bufts_test;
-                mem            = mem_test;
-                id_dense_start = id_dense_start_test;
-                LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), id_dense_start=%zu\n",
-                    __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                    std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                    size_t id_dense_start_test = id_dense_start;
+                    uint32_t n_converted_test = 0;
+                    for (;id_dense_start_test < nd; id_dense_start_test++) {
+                        const uint32_t n_convert_jd = std::min(step_size - n_converted_test, ngl_per_device_test[id_dense_start_test].n_part);
+                        ngl_per_device_test[id_dense_start_test].n_layer -= n_convert_jd;
+                        ngl_per_device_test[id_dense_start_test].n_part -= n_convert_jd;
+                        ngl_per_device_test[id].n_layer += n_convert_jd;
+                        n_converted_test += n_convert_jd;
 
-                ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
-                LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
-                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
-                    ngl_per_device = ngl_per_device_test;
-                    overflow_bufts = overflow_bufts_test;
-                    mem            = mem_test;
-                    id_dense_start = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
-                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                        if (ngl_per_device_test[id_dense_start_test].n_part > 0) {
+                            break;
+                        }
+                    }
+                    const std::vector<int64_t> mem_test = get_memory_for_layers(func_name, ngl_per_device_test, overflow_bufts);
+
+                    if (mem_test[id] <= targets[id]) {
+                        ngl_per_device = ngl_per_device_test;
+                        mem            = mem_test;
+                        id_dense_start = id_dense_start_test;
+                        LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
+                            func_name, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                    } else {
+                        ngl_per_device_high = ngl_per_device_test;
+                        mem_high            = mem_test;
+                        id_dense_start_high = id_dense_start_test;
+                        LOG_TRC("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start_high=%zu\n",
+                            func_name, id, ngl_per_device_high[id].n_layer, ngl_per_device_high[id].n_part, id_dense_start_high);
+                    }
+                    assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
+                    delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
                 }
             } else {
-                ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
-                LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
-                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
-                    ngl_per_device = ngl_per_device_test;
-                    overflow_bufts = overflow_bufts_test;
-                    mem            = mem_test;
-                    id_dense_start = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
-                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                ngl_per_device = ngl_per_device_high;
+                mem            = mem_high;
+                id_dense_start = id_dense_start_high;
+                LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
+                    func_name, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+            }
+
+            // try to fit at least part of one more layer
+            if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+                std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
+                size_t id_dense_start_test = id_dense_start;
+                ngl_per_device_test[id_dense_start_test].n_layer--;
+                ngl_per_device_test[id_dense_start_test].n_part--;
+                ngl_per_device_test[id].n_layer++;
+                ngl_per_device_test[id].n_part++;
+                if (ngl_per_device_test[id_dense_start_test].n_part == 0) {
+                    id_dense_start_test++;
+                }
+                std::vector<ggml_backend_buffer_type_t> overflow_bufts_test = overflow_bufts;
+                if (id < nd - 1) {
+                    overflow_bufts_test[id] = ggml_backend_dev_buffer_type(devs[id + 1]);
+                }
+                auto try_overflow_type = [&](const common_layer_fraction_t overflow_type, const char * name) -> bool {
+                    ngl_per_device_test[id].overflow_type = overflow_type;
+                    LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_%s\n", func_name, name);
+                    const std::vector<int64_t> mem_test = get_memory_for_layers(func_name, ngl_per_device_test, overflow_bufts_test);
+                    if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                        ngl_per_device = ngl_per_device_test;
+                        overflow_bufts = overflow_bufts_test;
+                        mem            = mem_test;
+                        id_dense_start = id_dense_start_test;
+                        LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", %s), id_dense_start=%zu\n",
+                            func_name, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, name, id_dense_start);
+                        return true;
+                    }
+                    return false;
+                };
+                if (split_gate_up) {
+                    if (try_overflow_type(LAYER_FRACTION_UP, "UP")) {
+                        try_overflow_type(LAYER_FRACTION_GATE, "GATE");
+                    } else {
+                        try_overflow_type(LAYER_FRACTION_ATTN, "ATTN");
+                    }
+                } else if (!try_overflow_type(LAYER_FRACTION_GATE, "GATE")) {
+                    try_overflow_type(LAYER_FRACTION_ATTN, "ATTN");
                 }
             }
+
+            const int64_t projected_margin = dmds_full[id].free - mem[id];
+            LOG_TRC(
+                "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+                func_name, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
         }
 
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_TRC(
-            "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
-            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
-    }
+        // print info for devices that were not changed during the conversion from dense only to full layers:
+        for (size_t id = id_dense_start + 1; id < nd; id++) {
+            const int64_t projected_margin = dmds_full[id].free - mem[id];
+            LOG_TRC(
+                "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
+                func_name, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
+        }
+    };
 
-    // print info for devices that were not changed during the conversion from dense only to full layers:
-    for (size_t id = id_dense_start + 1; id < nd; id++) {
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_TRC(
-            "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
-            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
+    // the fill above has two sources of waste:
+    //   - a layer whose up and gate sit on different devices costs extra cross-device copies and graph splits on every
+    //     evaluation and cannot use the fused gate+up kernels
+    //   - while a device is filled, the MoE weights of later layers are still in system memory, with op offload a device
+    //     then reserves room to copy them, room that is not needed once those weights are in device memory as well
+    // so first fill with measurements without op offload, keep that layout if it puts all weights in device memory and
+    // still fits with the real settings, else fall back to the previous behavior
+    //   LLAMA_FIT_OFFLOAD_ROOM=1: always count the copy room (previous behavior)
+    //   LLAMA_FIT_SPLIT_GATE_UP=-1: first try layouts without split layers (costs one more fill, which at long contexts
+    //   usually ends with weights in system memory), =0: never split, unset or 1: allow splits
+    const char * env_split   = getenv("LLAMA_FIT_SPLIT_GATE_UP");
+    const char * env_offload = getenv("LLAMA_FIT_OFFLOAD_ROOM");
+    const int  split_mode    = env_split ? atoi(env_split) : 1;
+    const bool offload_room  = env_offload && atoi(env_offload) != 0;
+
+    auto spills_to_host = [&]() -> bool {
+        for (size_t id = 0; id < nd; id++) {
+            const ngl_t & n = ngl_per_device[id];
+            if (n.n_part > 1 || (n.n_part == 1 && overflow_bufts[id] == ggml_backend_cpu_buffer_type())) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    struct fill_attempt {
+        bool split_gate_up;
+        bool op_offload;
+    };
+    std::vector<fill_attempt> attempts;
+    if (cparams->op_offload && !offload_room) {
+        if (split_mode != 1) {
+            attempts.push_back({false, false});
+        }
+        if (split_mode != 0) {
+            attempts.push_back({true, false});
+        }
+    } else if (split_mode == -1) {
+        attempts.push_back({false, cparams->op_offload});
+    }
+    attempts.push_back({split_mode != 0, cparams->op_offload}); // last resort, always kept
+
+    const std::vector<ngl_t>                      ngl_per_device_dense = ngl_per_device;
+    const std::vector<int64_t>                    mem_dense            = mem;
+    const std::vector<ggml_backend_buffer_type_t> overflow_bufts_dense = overflow_bufts;
+
+    for (size_t ia = 0; ia < attempts.size(); ia++) {
+        const fill_attempt & a = attempts[ia];
+        ngl_per_device     = ngl_per_device_dense;
+        mem                = mem_dense;
+        overflow_bufts     = overflow_bufts_dense;
+        measure_op_offload = a.op_offload;
+        LOG_TRC("%s: filling with split_gate_up=%d, op_offload=%d\n", __func__, int(a.split_gate_up), int(a.op_offload));
+
+        fill_front_to_back(a.split_gate_up);
+        measure_op_offload = cparams->op_offload;
+
+        if (ia + 1 == attempts.size()) {
+            break;
+        }
+        if (spills_to_host()) {
+            LOG_TRC("%s: some weights stay in system memory, trying the next layout\n", __func__);
+            continue;
+        }
+        if (a.op_offload != cparams->op_offload) {
+            const std::vector<int64_t> mem_real = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+            bool fits = true;
+            for (size_t id = 0; id < nd; id++) {
+                fits = fits && mem_real[id] <= targets[id];
+            }
+            if (!fits) {
+                LOG_TRC("%s: the layout does not fit with op offload, trying the next layout\n", __func__);
+                continue;
+            }
+        }
+        break;
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
