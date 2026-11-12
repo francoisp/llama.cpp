@@ -776,6 +776,9 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // longest common prefix of a cached prompt with tokens
+    size_t best_lcp(const server_tokens & tokens) const;
+
     void update();
 };
 

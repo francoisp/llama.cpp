@@ -556,13 +556,6 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: true,
-				help: 'Use the draft model the server was started with (e.g. DSpark) to generate several tokens per step. Turn it off for text where few drafts are accepted, such as prose: the draft model then pauses and catches up when it is turned back on. No effect on servers without a draft model.',
-				key: SETTINGS_KEYS.SPECULATIVE,
-				label: 'Speculative decoding',
-				type: SettingsFieldType.CHECKBOX
-			},
-			{
 				defaultValue: undefined,
 				help: 'Last n tokens to consider for penalizing repetition',
 				key: SETTINGS_KEYS.REPEAT_LAST_N,

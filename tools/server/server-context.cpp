@@ -1888,6 +1888,55 @@ private:
         return nullptr;
     }
 
+    // shortest prefix worth copying between slots
+    static constexpr int32_t n_fork_min = 512;
+
+    // tokens of src that a task sharing lcp tokens with it can keep after a copy: all of them if the memory can be
+    // truncated anywhere, else up to the last checkpoint at or before lcp
+    int32_t fork_reuse(const server_slot & src, size_t lcp) const {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            return (int32_t) lcp;
+        }
+
+        int64_t reuse = 0;
+        for (const auto & ckpt : src.prompt.checkpoints) {
+            if (ckpt->n_tokens <= (int64_t) lcp) {
+                reuse = std::max(reuse, ckpt->n_tokens);
+            }
+        }
+
+        return (int32_t) reuse;
+    }
+
+    // start the task in a free slot (empty or least recently used) from a copy of src, which keeps its context;
+    // returns nullptr if there is no free slot or src offers too little
+    server_slot * fork_into_free_slot(server_slot & src, const server_task & task, size_t lcp) {
+        const int32_t reuse = fork_reuse(src, lcp);
+        if (reuse < n_fork_min || task.is_stateless()) {
+            return nullptr;
+        }
+
+        const auto free_slots = get_free_slots(1, src.id);
+        if (free_slots.empty()) {
+            return nullptr;
+        }
+
+        server_slot * dst = free_slots[0];
+
+        // the target is about to lose its own context: keep it in the prompt cache, as the LRU path does
+        if (prompt_cache && !dst->prompt.tokens.empty()) {
+            dst->prompt_save(*prompt_cache);
+            prompt_cache->update();
+        }
+
+        src.copy_prompt_to(*dst);
+
+        SLT_INF(*dst, "copied the context of slot %d (%d tokens) to reuse %d shared tokens, slot %d keeps its context\n",
+                src.id, src.prompt.n_tokens(), reuse, src.id);
+
+        return dst;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1906,9 +1955,13 @@ private:
             }
         }
 
-        // find the slot that has at least n% prompt similarity
+        // find the slot that has at least n% prompt similarity; among the slots that reuse about as much of the prompt,
+        // the one that loses the least of its context (a subagent sharing a long system prompt with the main agent
+        // should not take the main agent's slot when the slot of an earlier subagent has the same prefix)
+        size_t lcp_best = 0;
         if (slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
+            float  f_sim_best = 0;
+            size_t loss_best  = SIZE_MAX;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -1932,28 +1985,69 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
+                const size_t loss = tokens.size() - lcp_len;
 
-                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
+                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f, loss = %zu\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity, loss);
 
-                // select the current slot if the criteria match
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                if (f_sim_cur <= slot_prompt_similarity) {
+                    continue;
+                }
+
+                // reuses clearly more, or about as much (within 1/64) while losing less
+                const size_t tol = lcp_best/64;
+                if (lcp_len > lcp_best + tol || (lcp_len + tol >= lcp_best && loss < loss_best)) {
                     f_sim_best = f_sim_cur;
+                    lcp_best   = lcp_len;
+                    loss_best  = loss;
 
                     ret = &slot;
                 }
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const float f_keep = float(lcp_best) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
+                // if we are about to lose a large portion of the existing context, give the task another slot that
+                // starts from a copy of this one instead (the copy is truncated to the shared prefix when the task
+                // starts), or else save the context in the prompt cache
                 if (f_keep < 0.5f) {
+                    server_slot * dst = task.id_slot == -1 ? fork_into_free_slot(*ret, task, lcp_best) : nullptr;
+                    if (dst != nullptr) {
+                        return dst;
+                    }
+
                     update_cache = true;
+                }
+            }
+        }
+
+        // a slot that is generating may share a much longer prefix than any idle slot (the main agent while its
+        // subagents start): copy it into a free slot
+        if (task.id_slot == -1) {
+            server_slot * src = nullptr;
+            int32_t reuse_src = 0;
+
+            for (server_slot & slot : slots) {
+                if (!slot.is_processing() || slot.state != SLOT_STATE_GENERATING || slot.prompt.tokens.empty()) {
+                    continue;
+                }
+
+                const int32_t reuse = fork_reuse(slot, slot.prompt.tokens.get_common_prefix(task.tokens));
+                if (reuse > reuse_src) {
+                    reuse_src = reuse;
+                    src = &slot;
+                }
+            }
+
+            if (src != nullptr && reuse_src >= n_fork_min && (size_t) reuse_src > 2*lcp_best) {
+                server_slot * dst = fork_into_free_slot(*src, task, reuse_src);
+                if (dst != nullptr) {
+                    return dst;
                 }
             }
         }
@@ -1967,6 +2061,15 @@ private:
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
+                update_cache = true;
+            }
+        }
+
+        // the prompt cache may hold a much longer match than the chosen slot (a context that was moved out of its slot)
+        if (ret && !update_cache && prompt_cache && task.id_slot == -1 && !task.is_stateless()) {
+            const size_t lcp_cache = prompt_cache->best_lcp(task.tokens);
+            if (lcp_cache > lcp_best + std::max<size_t>(n_fork_min, lcp_best/2)) {
+                SLT_INF(*ret, "the prompt cache has a longer match (%zu tokens) than the slot (%zu tokens)\n", lcp_cache, lcp_best);
                 update_cache = true;
             }
         }

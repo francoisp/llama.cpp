@@ -1090,7 +1090,6 @@ export class ChatService {
 			repeat_penalty,
 			// Other parameters
 			samplers,
-			speculative,
 			stream,
 			// Generation parameters
 			temperature,
@@ -1238,8 +1237,6 @@ export class ChatService {
 		}
 
 		if (backend_sampling !== undefined) requestBody.backend_sampling = backend_sampling;
-
-		if (speculative !== undefined) requestBody.speculative = speculative;
 
 		if (timings_per_token !== undefined) requestBody.timings_per_token = timings_per_token;
 
