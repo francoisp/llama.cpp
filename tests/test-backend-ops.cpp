@@ -9842,6 +9842,7 @@ struct test_prefix_mask : public test_case {
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t); // the sentinels of the test harness
                 continue;
             }
             // edge rows: nothing visible, everything visible, out of range on both sides
