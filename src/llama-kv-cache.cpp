@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -62,6 +63,71 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+const llama_sparse_api * llama_sparse_api_dev(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    static std::map<ggml_backend_reg_t, llama_sparse_api> apis;
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = apis.find(reg);
+    if (it == apis.end()) {
+        llama_sparse_api api;
+        api.buft        = (ggml_backend_dev_sparse_buffer_type_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_sparse_buffer_type");
+        api.granularity = (ggml_backend_sparse_granularity_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_granularity");
+        api.set_budget  = (ggml_backend_sparse_set_budget_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_set_budget");
+        api.commit      = (ggml_backend_sparse_commit_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_commit");
+        api.decommit    = (ggml_backend_sparse_decommit_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_decommit");
+        api.committed   = (ggml_backend_sparse_committed_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_committed");
+        api.missing     = (ggml_backend_sparse_missing_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sparse_missing");
+        if (!(api.buft && api.granularity && api.set_budget && api.commit && api.decommit && api.committed && api.missing)) {
+            api = llama_sparse_api();
+        }
+        it = apis.emplace(reg, api).first;
+    }
+    return it->second.buft ? &it->second : nullptr;
+}
+
+const llama_sparse_api * llama_sparse_api_buf(ggml_backend_buffer_t buf) {
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    const llama_sparse_api * api = llama_sparse_api_dev(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)));
+    return api && api->granularity(buf) > 0 ? api : nullptr;
+}
+
+// copy the first n_rows rows of stream ssrc to stream sdst of a sparse 3D tensor [n_embd, kv_size, n_stream]:
+// commit those rows of sdst first, release the rest of sdst (its last chunk excepted: padded writes go there)
+void llama_kv_cache::stream_copy_sparse(const llama_sparse_api & sp, ggml_tensor * t, uint32_t ssrc, uint32_t sdst, uint32_t n_rows) {
+    ggml_backend_buffer_t buf = t->buffer;
+    const size_t base   = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(buf);
+    const size_t stride = t->nb[2];
+    const size_t gran   = sp.granularity(buf);
+    const size_t n_copy = (size_t) n_rows*t->nb[1];
+
+    if (n_copy > 0 && !sp.commit(buf, base + sdst*stride, n_copy, true)) {
+        throw std::runtime_error("the KV pool is full: cannot copy a sequence");
+    }
+    const size_t keep_end = GGML_PAD(n_copy, gran);
+    if (stride > gran && keep_end < stride - gran) {
+        sp.decommit(buf, base + sdst*stride + keep_end, stride - gran - keep_end);
+    }
+    if (n_copy == 0) {
+        return;
+    }
+
+    ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_tensor * src = ggml_view_1d(ctx.get(), t, n_copy/ggml_element_size(t), ssrc*stride);
+    ggml_tensor * dst = ggml_view_1d(ctx.get(), t, n_copy/ggml_element_size(t), sdst*stride);
+    GGML_ASSERT(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS && ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_copy(src, dst);
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                      bool   no_alloc,
@@ -80,7 +146,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                const char * name_tag,
-                     bool   is_indexer) :
+                     bool   is_indexer,
+    const buft_for_dev_cb & buft_for_dev) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
@@ -216,6 +283,11 @@ llama_kv_cache::llama_kv_cache(
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
+            if (buft_for_dev) {
+                if (auto * b = buft_for_dev(dev)) {
+                    buft = b;
+                }
+            }
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -893,6 +965,14 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
+
+                if (const auto * sp = llama_sparse_api_buf(layer.k->buffer)) {
+                    // a sparse stream takes device memory only for its rows: copy the used rows, after committing
+                    // them in the destination, and release the rest of it
+                    GGML_ASSERT(!layer.v && "sparse KV streams are K-only");
+                    stream_copy_sparse(*sp, layer.k, ssrc, sdst, v_cells[ssrc].used_max_p1());
+                    continue;
+                }
 
                 ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
 

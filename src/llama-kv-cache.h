@@ -17,6 +17,23 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// sparse buffers (ggml-backend.h): addressable in full, device memory only for the committed ranges
+struct llama_sparse_api {
+    ggml_backend_dev_sparse_buffer_type_t buft        = nullptr;
+    ggml_backend_sparse_granularity_t     granularity = nullptr;
+    ggml_backend_sparse_set_budget_t      set_budget  = nullptr;
+    ggml_backend_sparse_commit_t          commit      = nullptr;
+    ggml_backend_sparse_decommit_t        decommit    = nullptr;
+    ggml_backend_sparse_committed_t       committed   = nullptr;
+    ggml_backend_sparse_missing_t         missing     = nullptr;
+};
+
+// the sparse buffer functions of the backend of a device, nullptr if it has none
+const llama_sparse_api * llama_sparse_api_dev(ggml_backend_dev_t dev);
+
+// the sparse buffer functions for a buffer, nullptr if the buffer is not sparse
+const llama_sparse_api * llama_sparse_api_buf(ggml_backend_buffer_t buf);
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -96,6 +113,9 @@ public:
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
+    // the buffer type to allocate the tensors of a device on, nullptr for its default
+    using buft_for_dev_cb = std::function<ggml_backend_buffer_type_t(ggml_backend_dev_t dev)>;
+
     llama_kv_cache(
             const llama_model & model,
                          bool   no_alloc,
@@ -116,9 +136,14 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
+                       bool   is_indexer = false,
+        // e.g. sparse buffers for streams that share a memory budget (llama_sparse_api)
+        const buft_for_dev_cb & buft_for_dev = nullptr);
 
     ~llama_kv_cache() = default;
+
+    // copy the used rows of a stream of a sparse tensor (see stream copies in update())
+    static void stream_copy_sparse(const llama_sparse_api & sp, ggml_tensor * t, uint32_t ssrc, uint32_t sdst, uint32_t n_rows);
 
     //
     // llama_memory_i

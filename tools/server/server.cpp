@@ -111,6 +111,30 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
+// the GPUs have sparse buffers (CUDA virtual memory), which the DeepSeek V4.1 shared KV pool needs
+static bool server_sparse_kv_supported() {
+    size_t n_gpu = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        auto fn = (ggml_backend_dev_sparse_buffer_type_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_dev_sparse_buffer_type");
+        if (fn == nullptr || fn(dev) == nullptr) {
+            return false;
+        }
+        n_gpu++;
+    }
+    return n_gpu > 0;
+}
+
+// the shared KV pool can be used: sparse buffers on the GPUs, and not turned off with LLAMA_DSV4_SHARED_POOL=0
+static bool server_kv_pool_available() {
+    const char * env = getenv("LLAMA_DSV4_SHARED_POOL");
+    return !(env && atoi(env) == 0) && server_sparse_kv_supported();
+}
+
 // DeepSeek V4.1 on several GPUs: the settings measured best on 8x RTX 3090 at 512K+ context (see the server
 // README), applied to the options the user did not set
 static void server_apply_deepseek41_defaults(common_params & params) {
@@ -155,6 +179,13 @@ static void server_apply_deepseek41_defaults(common_params & params) {
         applied.push_back("--spec-draft-n-max 4");
     }
 
+    // several slots share one context (the shared KV pool) instead of n_ctx/N each, when the GPUs support it;
+    // the auto slot count is handled with -np
+    if (params.n_parallel > 1 && !is_set("--kv-unified") && server_kv_pool_available()) {
+        params.kv_unified = true;
+        applied.push_back("--kv-unified (shared KV pool)");
+    }
+
     // the projector on the CPU: on a GPU it takes the room of expert weights, which slows every token down
     // (an image takes 4-5 s on the CPU instead of about 1 s)
     if (!params.mmproj.path.empty() && !is_set("--no-mmproj-offload")) {
@@ -187,6 +218,21 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 
         if (arch == "deepseek41") {
             server_apply_deepseek41_defaults(params);
+        }
+
+        if (params.n_parallel < 0 && arch == "deepseek41" && server_kv_pool_available()) {
+            // the shared KV pool: 4 slots that share one context (each can grow to all of it), the KV memory of
+            // the idle slots is given back as the others need it
+            SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true (shared KV pool for deepseek41)\n");
+
+            params.n_parallel = 4;
+            params.kv_unified = true;
+        }
+
+        // the shared KV pool of DeepSeek V4.1 (see llama_kv_cache_dsv4): every slot can grow to the whole context,
+        // the server purges idle slots only when the pool is full
+        if (arch == "deepseek41" && params.kv_unified && params.n_parallel > 1 && server_kv_pool_available()) {
+            params.kv_shared_pool = true;
         }
 
         if (params.n_parallel < 0) {

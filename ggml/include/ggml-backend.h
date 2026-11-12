@@ -230,6 +230,25 @@ extern "C" {
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+
+    // Sparse buffers: the whole size is addressable, but only the committed ranges take device memory; the rest reads
+    // as zeros and must not be written. A buffer commits in chunks of its granularity, at most its budget in total.
+    // "ggml_backend_dev_sparse_buffer_type": the sparse buffer type of a device, NULL if it has none
+    typedef ggml_backend_buffer_type_t   (*ggml_backend_dev_sparse_buffer_type_t)(ggml_backend_dev_t device);
+    // "ggml_backend_sparse_granularity"
+    typedef size_t                       (*ggml_backend_sparse_granularity_t)(ggml_backend_buffer_t buffer);
+    // "ggml_backend_sparse_set_budget": the most bytes that may be committed at once
+    typedef void                         (*ggml_backend_sparse_set_budget_t)(ggml_backend_buffer_t buffer, size_t budget);
+    // "ggml_backend_sparse_commit": back [offset, offset + size) with zeroed device memory; false (and nothing
+    // committed) if that would go past the budget. With sync, waits for the device before it changes a mapping
+    // (kernels in flight may read the zeros there); without, the caller knows that none reads those addresses
+    typedef bool                         (*ggml_backend_sparse_commit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool sync);
+    // "ggml_backend_sparse_decommit": release the chunks inside [offset, offset + size), which read as zeros again
+    typedef void                         (*ggml_backend_sparse_decommit_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+    // "ggml_backend_sparse_committed": the bytes committed
+    typedef size_t                       (*ggml_backend_sparse_committed_t)(ggml_backend_buffer_t buffer);
+    // "ggml_backend_sparse_missing": the bytes a commit of [offset, offset + size) would add
+    typedef size_t                       (*ggml_backend_sparse_missing_t)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)

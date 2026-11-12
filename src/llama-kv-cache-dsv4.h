@@ -160,6 +160,45 @@ public:
     // copy the sources into their mirrors after a state read
     void refill_comp_mirrors();
 
+    // shared KV pool (unified KV with several sequences): the CSA/HCA streams of every sequence can grow to the
+    // whole context, but they are sparse buffers that take device memory only for the rows in use, within a
+    // budget of one context per device. Commit the rows that a ubatch writes, before its graph runs.
+    bool pool_enabled() const { return pool; }
+    bool pool_commit(const llama_ubatch & ubatch, int64_t n_kv_csa, int64_t n_kv_hca);
+
+    // every stream of the pool spans the whole context and a ubatch pads its streams to the longest one:
+    // ubatches with several tokens per sequence hold one sequence (see init_batch)
+    uint32_t get_n_seqs_pp_max(uint32_t n_seq_max) const override { return pool ? 1 : n_seq_max; }
+
+    // the pool: tokens the budgets still hold beyond the rows of every sequence (idle ones included)
+    int32_t get_n_tokens_free() const override;
+
+private:
+    bool pool = false;
+
+    // the tokens of all the sequences together: the context, less a margin per sequence for the draft tokens of a
+    // draft model, whose unified cache holds the same context (it must not fill up before the pool)
+    int64_t pool_tokens_max = 0;
+    int64_t pool_tokens(const std::vector<llama_pos> & pos_batch) const; // tokens of the sequences, with a batch
+
+    struct pool_buf {
+        ggml_backend_buffer_t     buf;
+        const llama_sparse_api  * api;
+        size_t                    budget;
+        llama_kv_cache          * kv;      // the cache of the tensors (CSA or HCA)
+        uint32_t                  ratio;
+        std::vector<std::pair<ggml_tensor *, uint32_t>> tensors; // stream tensors [n_embd, rows, n_stream] and their row ratio
+        std::vector<int64_t>      read_hi; // per stream: rows the graphs since the last device sync may read
+    };
+    std::vector<pool_buf> pool_bufs;
+
+    void   pool_init();                                                     // budgets, the chunk of the last row
+    size_t pool_tensor_budget(const ggml_tensor * t) const;                 // device memory a stream tensor may use
+    bool   pool_fits(const std::vector<llama_ubatch> & ubatches, bool warn) const; // the rows of a batch fit the budgets
+    bool   pool_trim();                                                     // give back the rows committed ahead
+    void   pool_release(llama_kv_cache * kv, uint32_t stream);              // all rows of a stream but the last
+    static uint32_t pool_rows(llama_pos pos_max, uint32_t ratio) { return pos_max < 0 ? 0 : (uint32_t) pos_max/ratio + 1; }
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -236,13 +275,16 @@ public:
     // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // full context (worst-case graphs): view the first ns streams, as many as the graph of the reserve ubatch has
+    void set_full_streams(uint32_t ns) const;
+
 private:
     size_t i_next = 0;
 
     llama_kv_cache * kv_swa = nullptr;
 
-    slot_info_vec_t sinfos_write;
-    slot_info_vec_t sinfos_read;
+    mutable slot_info_vec_t sinfos_write;
+    mutable slot_info_vec_t sinfos_read;
     std::vector<llama_ubatch> ubatches;
     std::vector<llama_ubatch> ubatches_write;
 
@@ -276,11 +318,14 @@ public:
 
     std::vector<ggml_tensor *> get_k_rot() const;
 
+    // full context (worst-case graphs): view the first ns streams, as many as the graph of the reserve ubatch has
+    void set_full_streams(uint32_t ns) const;
+
 private:
     llama_kv_cache * kv;
 
     size_t i_cur = 0;
-    slot_info_vec_t sinfos;
+    mutable slot_info_vec_t sinfos;
     std::vector<llama_ubatch> ubatches;
 
     uint32_t n_kv;

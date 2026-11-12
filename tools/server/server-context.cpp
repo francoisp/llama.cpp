@@ -1766,7 +1766,10 @@ private:
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
-                if (params_base.kv_unified) {
+                if (params_base.kv_shared_pool) {
+                    // the slots keep their KV until the pool is full, then the idle ones are saved and purged
+                    SRV_TRC("%s", "shared KV pool: idle slots are saved to prompt cache only when purged\n");
+                } else if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 } else {
                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
@@ -1930,6 +1933,13 @@ private:
 
         server_slot * dst = free_slots[0];
 
+        // the shared KV pool holds a second copy of the context: make room for it, or do not fork
+        if (params_base.kv_shared_pool &&
+            !pool_make_room((int64_t) src.prompt.n_tokens() - dst->prompt.n_tokens() + 1024, &src, dst)) {
+            SLT_INF(*dst, "the shared KV pool has no room for a copy of slot %d (%d tokens)\n", src.id, src.prompt.n_tokens());
+            return nullptr;
+        }
+
         // the target is about to lose its own context: keep it in the prompt cache, as the LRU path does
         if (prompt_cache && !dst->prompt.tokens.empty()) {
             dst->prompt_save(*prompt_cache);
@@ -2072,8 +2082,9 @@ private:
             }
         }
 
-        // the prompt cache may hold a much longer match than the chosen slot (a context that was moved out of its slot)
-        if (ret && !update_cache && prompt_cache && task.id_slot == -1 && !task.is_stateless()) {
+        // the prompt cache may hold a much longer match than the chosen slot (a context that was moved out of its slot,
+        // also for a task that asked for that slot)
+        if (ret && !update_cache && prompt_cache && !task.is_stateless()) {
             const size_t lcp_cache = prompt_cache->best_lcp(task.tokens);
             if (lcp_cache > lcp_best + std::max<size_t>(n_fork_min, lcp_best/2)) {
                 SLT_INF(*ret, "the prompt cache has a longer match (%zu tokens) than the slot (%zu tokens)\n", lcp_cache, lcp_best);
@@ -2094,6 +2105,11 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                // the shared KV pool: room for the prompt to load, from the idle slots
+                if (params_base.kv_shared_pool) {
+                    pool_make_room((int64_t) task.tokens.size() - ret->prompt.n_tokens(), ret, nullptr);
+                }
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
@@ -2112,31 +2128,153 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(const server_slot * keep1 = nullptr, const server_slot * keep2 = nullptr) {
         bool res = false;
 
         if (!params_base.kv_unified) {
             return res;
         }
 
+        // the least recently used idle slot first
+        server_slot * lru = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0 || &slot == keep1 || &slot == keep2) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (!lru || slot.t_last_used < lru->t_last_used) {
+                lru = &slot;
             }
         }
 
+        if (lru) {
+            auto & slot = *lru;
+            SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+
+            // keep it in host memory, a later request with that prompt can load it back
+            if (prompt_cache) {
+                slot.prompt_save(*prompt_cache);
+                prompt_cache->update();
+            }
+
+            // clear slots one by one
+            slot.prompt_clear();
+
+            res = true;
+        }
+
         return res;
+    }
+
+    //
+    // shared KV pool (DeepSeek V4.1): the slots share one context, an idle slot keeps its KV until the room is needed
+    //
+
+    // tokens the pool can still take, counting the idle slots but keep1/keep2 as purgeable
+    int64_t pool_n_free(const server_slot * keep1, const server_slot * keep2) const {
+        const int32_t n_free = llama_memory_n_tokens_free(llama_get_memory(ctx_tgt));
+        if (n_free < 0) {
+            return INT64_MAX;
+        }
+        int64_t res = n_free;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing() && &slot != keep1 && &slot != keep2) {
+                res += slot.prompt.n_tokens();
+            }
+        }
+        return res;
+    }
+
+    // purge idle slots (least recently used first, not keep1/keep2) until the pool has n tokens free
+    bool pool_make_room(int64_t n, const server_slot * keep1, const server_slot * keep2) {
+        while (llama_memory_n_tokens_free(llama_get_memory(ctx_tgt)) < n) {
+            if (!try_clear_idle_slots(keep1, keep2)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // may the task start in slot now? It needs its prompt past what the slot holds and room to generate; when the
+    // pool cannot give that, the task waits for a running one to finish (unless none runs: nothing would free up)
+    bool pool_admit(const server_slot & slot, const server_task & task) const {
+        bool any_processing = false;
+        for (const auto & s : slots) {
+            any_processing |= s.is_processing();
+        }
+        if (!any_processing) {
+            return true;
+        }
+        const auto n_gen = [](const server_task & t) -> int64_t {
+            return t.params.n_predict >= 0 ? std::min<int64_t>(t.params.n_predict, 1024) : 1024;
+        };
+        const int64_t n_keep = (int64_t) slot.prompt.tokens.get_common_prefix(task.tokens);
+        const int64_t need   = (int64_t) task.n_tokens() - n_keep + n_gen(task);
+        // the rows of the slot past the shared prefix are given back; the running tasks still need the rest of their
+        // prompt and room to generate
+        int64_t avail = pool_n_free(&slot, nullptr) + (slot.prompt.n_tokens() - n_keep);
+        for (const auto & s : slots) {
+            if (s.is_processing() && s.task) {
+                avail -= std::max<int64_t>(0, (int64_t) s.task->n_tokens() - s.prompt.n_tokens()) + n_gen(*s.task);
+            }
+        }
+        if (need > avail) {
+            SRV_INF("shared KV pool: task %d needs %" PRId64 " tokens, %" PRId64 " available, waiting for a running task\n",
+                    task.id, need, avail);
+            return false;
+        }
+        return true;
+    }
+
+    // the pool is full and no slot is idle: stop the slot with the least context, so that the others go on (the
+    // server would otherwise fail them all), and drop its tokens from the rest of the batch
+    bool pool_preempt(int32_t off) {
+        server_slot * victim = nullptr;
+        int n_proc = 0;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            ++n_proc;
+            if (!victim || slot.prompt.n_tokens() < victim->prompt.n_tokens()) {
+                victim = &slot;
+            }
+        }
+        if (n_proc < 2) {
+            return false;
+        }
+
+        const int32_t id = victim->id;
+        SRV_WRN("the shared KV pool is full: stopping slot %d (%d tokens) so that the other slots go on\n", id, victim->prompt.n_tokens());
+        send_error(*victim, "the shared KV pool is full: the other requests hold the context, retry later", ERROR_TYPE_UNAVAILABLE);
+        victim->release();
+        victim->prompt_clear();
+        victim->i_batch = -1;
+        victim->spec_i_batch.clear();
+
+        std::vector<int32_t> n_drop_before(batch.tokens.size() + 1, 0);
+        std::vector<server_batch::token> kept;
+        kept.reserve(batch.tokens.size());
+        int32_t n_drop = 0;
+        for (size_t i = 0; i < batch.tokens.size(); ++i) {
+            n_drop_before[i] = n_drop;
+            if ((int32_t) i >= off && batch.tokens[i].id_slot == id) {
+                ++n_drop;
+                continue;
+            }
+            kept.push_back(batch.tokens[i]);
+        }
+        n_drop_before[batch.tokens.size()] = n_drop;
+        batch.tokens = std::move(kept);
+
+        for (auto & slot : slots) {
+            if (slot.i_batch >= 0) {
+                slot.i_batch -= n_drop_before[slot.i_batch];
+            }
+            for (auto & i : slot.spec_i_batch) {
+                i -= n_drop_before[i];
+            }
+        }
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -3265,6 +3403,11 @@ private:
                         break;
                     }
 
+                    if (params_base.kv_shared_pool && !task.is_parent() && !pool_admit(*slot, task)) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -3283,7 +3426,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && !params_base.kv_shared_pool) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -5088,6 +5231,11 @@ private:
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
+                    if (params_base.kv_shared_pool && pool_preempt(off)) {
+                        n_batch = llama_n_batch(ctx_tgt);
+                        SRV_WRN("retrying the batch without the stopped slot, off = %d, n_batch = %d\n", off, n_batch);
+                        return false;
+                    }
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";

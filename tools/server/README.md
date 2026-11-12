@@ -433,7 +433,7 @@ environment variable), and logs the ones it applied:
 | --- | --- |
 | `-ub 256` | 15% faster prefill than 128, with compute buffers small enough for 512K context |
 | `-fitt 384` | leaves room on each GPU for the pipeline parallelism buffers next to the draft model; with 512 or more `--fit` falls back to the layout without pipeline parallelism |
-| `-np 1` (auto) | the V4 cache keeps one KV stream per slot: `-np N` gives N slots of `n_ctx/N`, `--kv-unified` would size every stream for the whole context |
+| `-np 4 --kv-unified` (auto) | the shared KV pool (below): 4 slots share the context, each can grow to all of it |
 | `-devd <last GPU> -ngld all` | the draft model whole on the GPU that `--fit` gives the fewest layers |
 | `--spec-draft-n-max 4` | with DSpark: 8% faster decode than 3 at 131K (93% of the drafts accepted), the same at 16K; 5 is slower |
 | `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
@@ -449,6 +449,27 @@ including the layouts of `--fit`; if `--fit` has to keep weights in host memory 
 flight. While other slots generate, prompts are processed one ubatch at a time (`--prefill-share`), so that the
 generating slots keep going. Speculative decoding can be turned off for the whole server with `POST /speculative`
 (or the toggle in the web UI), and pauses by itself while 3 or more slots generate (`--spec-max-slots`).
+
+#### Several slots: the shared KV pool
+
+With `--kv-unified` and several slots (the default above), the slots share one context of `-c` tokens instead of
+getting `n_ctx/N` each: a main agent can use 512K while subagents run next to it, as long as all the slots together
+stay within the context. The compressed KV of each slot takes device memory only for the rows it uses (CUDA virtual
+memory, in 2 MiB pieces), from a budget of one context per GPU, so `--fit` lays out the model as for a single slot and
+a single slot is as fast as with `-np 1`. Without CUDA virtual memory management the server keeps `-np 1`;
+`LLAMA_DSV4_SHARED_POOL=0` turns the pool off.
+
+- An idle slot keeps its KV, so a returning conversation continues where it was. When the pool is full, the least
+  recently used idle slot is saved to the prompt cache in host memory (`--cache-ram`) and cleared; a later request
+  with that prompt loads it back.
+- A request that does not fit next to the running ones (its prompt plus up to 1024 generated tokens, counting the
+  idle slots as free) waits until one of them finishes.
+- If the running requests still outgrow the pool, the one with the least context is stopped with an error (HTTP 503)
+  so that the others go on.
+- A request that shares a long prefix with a busy slot (a fork) starts from a copy of that slot's KV, which takes
+  room in the pool for a second copy of the prefix.
+- A ubatch with several tokens of a slot (prompt, draft verification) holds that slot only, with the compute buffers
+  of a single slot; plain decoding of slots of similar length is batched.
 
 ## Build
 

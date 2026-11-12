@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 
@@ -24,6 +26,17 @@ static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
+
+// shared KV pool: offsets in the (sparse) buffer of a tensor
+static size_t dsv4_tensor_offset(const ggml_tensor * t) {
+    return (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+}
+
+// commit [offset, offset + size) of a tensor if its buffer is sparse
+static bool dsv4_pool_commit_range(const ggml_tensor * t, size_t offset, size_t size) {
+    const llama_sparse_api * api = llama_sparse_api_buf(t->buffer);
+    return api == nullptr || size == 0 || api->commit(t->buffer, dsv4_tensor_offset(t) + offset, size, true);
+}
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
@@ -198,6 +211,31 @@ static bool dsv4_batch_has_coupled(const llama_batch & batch) {
     return false;
 }
 
+// shared pool: may the sequences of this batch share ubatches? Only with one token each (decode: the attention
+// reads the selected rows only) and no stream much longer than the others (a ubatch pads its streams to the
+// longest one). Otherwise each ubatch holds one sequence, with the graph and the compute buffers of one sequence.
+static bool dsv4_pool_batch_shared(const llama_batch & batch) {
+    std::map<llama_seq_id, std::pair<int32_t, llama_pos>> seqs; // tokens, last position
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        auto & e = seqs[batch.seq_id[i][0]];
+        e.first  += 1;
+        e.second  = std::max(e.second, batch.pos[i]);
+    }
+    if (seqs.size() <= 1) {
+        return true;
+    }
+    int64_t sum = 0;
+    int64_t mx  = 0;
+    for (const auto & it : seqs) {
+        if (it.second.first > 1) {
+            return false;
+        }
+        sum += it.second.second + 1;
+        mx   = std::max<int64_t>(mx, it.second.second + 1);
+    }
+    return (int64_t) seqs.size()*mx <= std::max<int64_t>(2*sum, 65536);
+}
+
 static int64_t dsv4_comp_graph_n_stream(const llama_ubatch & ubatch, uint32_t n_stream) {
     // Coupled sequence sets must stay in one graph stream because their
     // compressed state is shared. Independent per-seq state can fan out.
@@ -330,6 +368,9 @@ static void dsv4_state_read_tensor_streams(
 
     for (uint32_t s = 0; s < ns; ++s) {
         const size_t offset = (size_t) (s0 + s)*stream_stride;
+        if (!dsv4_pool_commit_range(tensor, offset, size)) {
+            throw std::runtime_error("DSV4 state read: the shared KV pool is full");
+        }
         io.read_tensor(tensor, offset, size);
     }
 }
@@ -1268,11 +1309,6 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         return true;
     };
 
-    if (unified && n_seq_max > 1) {
-        LLAMA_LOG_WARN("%s: unified KV is not supported: every one of the %u sequences gets a stream for the whole context "
-                "(%u cells), use -np N without --kv-unified for N streams of n_ctx/N\n", __func__, n_seq_max, kv_size);
-    }
-
     // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
     const bool unified_raw = false;
 
@@ -1386,21 +1422,65 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     const bool unified_compressed = false;
 
+    // shared KV pool (see pool_enabled()): with unified KV the CSA/HCA streams of every sequence get the whole
+    // context, as sparse buffers whose device memory follows the rows in use (env LLAMA_DSV4_SHARED_POOL=0: off)
+    {
+        const char * env = getenv("LLAMA_DSV4_SHARED_POOL");
+        pool = unified && n_seq_max > 1 && offload && !(env && atoi(env) == 0);
+        for (const auto & d : model.devices) {
+            if (pool && ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const llama_sparse_api * api = llama_sparse_api_dev(d.dev);
+                pool = api != nullptr && api->buft(d.dev) != nullptr;
+            }
+        }
+        if (unified && n_seq_max > 1) {
+            if (pool) {
+                pool_tokens_max = (int64_t) kv_size - 64*(int64_t) n_seq_max;
+                LLAMA_LOG_INFO("%s: shared KV pool: %u sequences share one context of %u cells\n", __func__, n_seq_max, kv_size);
+            } else {
+                LLAMA_LOG_WARN("%s: unified KV without the shared pool (no sparse buffers): every one of the %u sequences gets a "
+                        "stream for the whole context (%u cells), use -np N without --kv-unified for N streams of n_ctx/N\n",
+                        __func__, n_seq_max, kv_size);
+            }
+        }
+    }
+    const llama_kv_cache::buft_for_dev_cb buft_pool = [](ggml_backend_dev_t dev) -> ggml_backend_buffer_type_t {
+        const llama_sparse_api * api = llama_sparse_api_dev(dev);
+        return api ? api->buft(dev) : nullptr;
+    };
+
+    // a stream starts on a chunk of the sparse buffer (2 MiB) when its rows are a multiple of this
+    const auto pool_rows_align = [&](const llama_hparams & hp, const layer_filter_cb & f) -> uint32_t {
+        uint32_t align = 256;
+        if (!pool) {
+            return align;
+        }
+        for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+            if (f(il)) {
+                const size_t chunk = (size_t) 2*1024*1024;
+                const size_t row   = ggml_row_size(type_k, hp.n_embd_k_gqa(il));
+                align = std::max<uint32_t>(align, (uint32_t) (chunk/std::gcd(chunk, row))); // a power of 2
+                break;
+            }
+        }
+        return align;
+    };
+
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_csa));
 
     kv_csa = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_csa, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_csa), 256u), n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_csa), pool_rows_align(hparams_csa, filter_csa)), n_seq_max,
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, "", false, pool ? buft_pool : nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_hca));
 
     kv_hca = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_hca, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_hca), 256u), n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_hca), pool_rows_align(hparams_hca, filter_hca)), n_seq_max,
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, "", false, pool ? buft_pool : nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_csa));
@@ -1431,11 +1511,253 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, no_alloc, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_lid);
 
+    if (pool && !no_alloc) {
+        pool_init();
+    }
+
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
     // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
     // compressed buffers up front so reads of un-written rows are deterministic.
     clear_compressed(-1, true);
+}
+
+//
+// shared KV pool
+//
+
+static constexpr size_t DSV4_POOL_CHUNK = 2*1024*1024; // sparse buffer granularity assumed for the budgets
+
+size_t llama_kv_cache_dsv4::pool_tensor_budget(const ggml_tensor * t) const {
+    // the rows of one whole stream, a partly used chunk at the end of each sequence, and the chunk of the last row
+    return t->nb[2] + 2*(size_t) n_seq_max*DSV4_POOL_CHUNK;
+}
+
+void llama_kv_cache_dsv4::pool_init() {
+    pool_bufs.clear();
+    for (llama_kv_cache * kv : { kv_csa.get(), kv_hca.get() }) {
+        const uint32_t ratio = kv == kv_csa.get() ? csa_state->get_ratio() : hca_state->get_ratio();
+        for (uint32_t il : kv->get_layer_ids()) {
+            ggml_tensor * t = kv->get_k_storage(il);
+            const llama_sparse_api * api = llama_sparse_api_buf(t->buffer);
+            GGML_ASSERT(api != nullptr && "shared KV pool: the stream tensors must be in sparse buffers");
+            auto it = std::find_if(pool_bufs.begin(), pool_bufs.end(), [&](const pool_buf & b) { return b.buf == t->buffer; });
+            if (it == pool_bufs.end()) {
+                pool_bufs.push_back({ t->buffer, api, 0, kv, ratio, {}, std::vector<int64_t>(n_seq_max, 0) });
+                it = pool_bufs.end() - 1;
+            }
+            it->budget += pool_tensor_budget(t);
+            it->tensors.emplace_back(t, ratio);
+        }
+    }
+    for (auto & b : pool_bufs) {
+        b.api->set_budget(b.buf, b.budget);
+        for (const auto & [t, ratio] : b.tensors) {
+            // padded tokens write the last row of their stream
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                const size_t last = dsv4_tensor_offset(t) + (size_t) (s + 1)*t->nb[2] - t->nb[1];
+                GGML_ASSERT(b.api->commit(b.buf, last, t->nb[1], true));
+            }
+        }
+        LLAMA_LOG_INFO("%s: %s: shared KV pool budget %.2f MiB for %zu stream tensors (%.2f MiB addressable)\n", __func__,
+                ggml_backend_buffer_name(b.buf), b.budget/1024.0/1024.0, b.tensors.size(), ggml_backend_buffer_get_size(b.buf)/1024.0/1024.0);
+    }
+}
+
+int64_t llama_kv_cache_dsv4::pool_tokens(const std::vector<llama_pos> & pos_batch) const {
+    int64_t res = 0;
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        llama_pos p = kv_raw->seq_pos_max((llama_seq_id) s);
+        if (s < pos_batch.size()) {
+            p = std::max(p, pos_batch[s]);
+        }
+        res += p + 1;
+    }
+    return res;
+}
+
+bool llama_kv_cache_dsv4::pool_fits(const std::vector<llama_ubatch> & ubatches, bool warn) const {
+    if (!pool || pool_bufs.empty()) {
+        return true;
+    }
+    std::vector<llama_pos> pos_max(n_seq_max, -1);
+    for (const auto & ub : ubatches) {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const llama_seq_id s = ub.seq_id[i][0];
+            if (s >= 0 && (uint32_t) s < n_seq_max) {
+                pos_max[s] = std::max(pos_max[s], ub.pos[i]);
+            }
+        }
+    }
+    if (pool_tokens(pos_max) > pool_tokens_max) {
+        if (warn) {
+            LLAMA_LOG_WARN("%s: the shared KV pool is full (%" PRId64 " tokens of %" PRId64 ")\n", __func__,
+                    pool_tokens(pos_max), pool_tokens_max);
+        }
+        return false;
+    }
+    for (const auto & b : pool_bufs) {
+        size_t need = b.api->committed(b.buf);
+        for (const auto & [t, ratio] : b.tensors) {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                const uint32_t rows = pool_rows(pos_max[s], ratio);
+                if (rows > 0) {
+                    need += b.api->missing(b.buf, dsv4_tensor_offset(t) + (size_t) s*t->nb[2], (size_t) rows*t->nb[1]);
+                }
+            }
+        }
+        if (need > b.budget) {
+            if (warn) {
+                LLAMA_LOG_WARN("%s: %s: the shared KV pool is full (%.1f MiB needed of %.1f MiB)\n", __func__,
+                        ggml_backend_buffer_name(b.buf), need/1024.0/1024.0, b.budget/1024.0/1024.0);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// rows committed ahead of the writes. Mapping a chunk while the graphs of earlier ubatches may still run (pipeline
+// parallelism) needs a device sync unless none of them reads it; a prompt graph reads up to 2048 + 255 rows past
+// its last row (the prefill padding). Committing 8192 rows ahead, in steps of 4096, keeps the chunks that are
+// mapped past those reads, so a long prompt maps its rows without stopping the pipeline.
+static constexpr uint32_t DSV4_POOL_LEAD = 8192;
+
+bool llama_kv_cache_dsv4::pool_commit(const llama_ubatch & ubatch, int64_t n_kv_csa, int64_t n_kv_hca) {
+    if (!pool || pool_bufs.empty()) {
+        return true;
+    }
+    std::vector<llama_pos> pos_max(n_seq_max, -1);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_seq_id s = ubatch.seq_id[i][0];
+        if (s >= 0 && (uint32_t) s < n_seq_max) {
+            pos_max[s] = std::max(pos_max[s], ubatch.pos[i]);
+        }
+    }
+    for (auto & b : pool_bufs) {
+        const ggml_tensor * t0   = b.tensors[0].first;
+        const size_t      row    = t0->nb[1];
+        const uint32_t    n_rows = (uint32_t) t0->ne[1];
+        const size_t      gran   = b.api->granularity(b.buf);
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            if (pos_max[s] < 0) {
+                continue;
+            }
+            // the layers of a buffer have the same rows, aligned to the chunks: they cross a chunk together
+            const size_t   off0 = dsv4_tensor_offset(t0) + (size_t) s*t0->nb[2];
+            const uint32_t need = pool_rows(pos_max[s], b.ratio);
+            if (b.api->missing(b.buf, off0, (size_t) std::min(n_rows, need + DSV4_POOL_LEAD/2)*row) == 0) {
+                continue;
+            }
+            // the first row to map: a sync only if a graph in flight may read it
+            size_t c = 0;
+            while (b.api->missing(b.buf, off0 + c*gran, gran) == 0) {
+                ++c;
+            }
+            const bool sync = (int64_t) (c*gran/row) < b.read_hi[s];
+
+            const auto commit_rows = [&](uint32_t rows) {
+                for (const auto & tr : b.tensors) {
+                    const ggml_tensor * t = tr.first;
+                    if (!b.api->commit(b.buf, dsv4_tensor_offset(t) + (size_t) s*t->nb[2], (size_t) rows*row, sync)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            // without the lead when the budget has no room for it; then without the leads of the other sequences
+            // (the ubatches of a batch before this one may have taken them; pool_fits counted the rows only)
+            if (!commit_rows(std::min(n_rows, need + DSV4_POOL_LEAD)) && !commit_rows(need) &&
+                !(pool_trim() && commit_rows(need))) {
+                LLAMA_LOG_ERROR("%s: %s: the shared KV pool is full\n", __func__, ggml_backend_buffer_name(b.buf));
+                return false;
+            }
+            if (sync) {
+                std::fill(b.read_hi.begin(), b.read_hi.end(), 0);
+            }
+        }
+        // the graph of this ubatch reads up to n_kv rows of each of its streams
+        const int64_t n_kv = b.kv == kv_csa.get() ? n_kv_csa : n_kv_hca;
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            if (pos_max[s] >= 0) {
+                b.read_hi[s] = std::max(b.read_hi[s], n_kv > 0 ? n_kv : (int64_t) n_rows);
+            }
+        }
+    }
+    return true;
+}
+
+int32_t llama_kv_cache_dsv4::get_n_tokens_free() const {
+    if (!pool || pool_bufs.empty()) {
+        return -1;
+    }
+    int64_t res = INT32_MAX;
+    for (const auto & b : pool_bufs) {
+        const size_t gran = b.api->granularity(b.buf);
+        const size_t row  = b.tensors[0].first->nb[1];
+        size_t used = 0;
+        for (const auto & tr : b.tensors) {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                // the chunks of the rows in use, and the chunk of the last row
+                const size_t bytes = (size_t) pool_rows(kv_raw->seq_pos_max((llama_seq_id) s), b.ratio)*tr.first->nb[1];
+                used += (bytes + gran - 1)/gran*gran + gran;
+            }
+        }
+        const size_t free = b.budget > used ? b.budget - used : 0;
+        res = std::min<int64_t>(res, (int64_t) (free/(b.tensors.size()*row))*b.ratio);
+    }
+    res = std::min(res, pool_tokens_max - pool_tokens({}));
+    return (int32_t) std::max<int64_t>(res, 0);
+}
+
+bool llama_kv_cache_dsv4::pool_trim() {
+    bool res = false;
+    for (auto & b : pool_bufs) {
+        const size_t gran = b.api->granularity(b.buf);
+        const size_t before = b.api->committed(b.buf);
+        for (const auto & [t, ratio] : b.tensors) {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                // keep the chunks of the rows in use and the chunk of the last row
+                const size_t off  = dsv4_tensor_offset(t) + (size_t) s*t->nb[2];
+                const size_t used = (size_t) pool_rows(kv_raw->seq_pos_max((llama_seq_id) s), ratio)*t->nb[1];
+                const size_t keep = (used + gran - 1)/gran*gran;
+                if (keep + gran < (size_t) t->nb[2]) {
+                    b.api->decommit(b.buf, off + keep, t->nb[2] - keep - gran);
+                }
+            }
+        }
+        if (b.api->committed(b.buf) < before) {
+            // decommit waited for the device
+            std::fill(b.read_hi.begin(), b.read_hi.end(), 0);
+            res = true;
+        }
+    }
+    if (res) {
+        LLAMA_LOG_INFO("%s: gave back the rows committed ahead of the sequences\n", __func__);
+    }
+    return res;
+}
+
+void llama_kv_cache_dsv4::pool_release(llama_kv_cache * kv, uint32_t stream) {
+    for (const auto & b : pool_bufs) {
+        for (const auto & [t, ratio] : b.tensors) {
+            bool in_kv = false;
+            for (uint32_t il : kv->get_layer_ids()) {
+                in_kv |= kv->get_k_storage(il) == t;
+            }
+            if (!in_kv) {
+                continue;
+            }
+            const size_t t_off = dsv4_tensor_offset(t);
+            const size_t off   = t_off + (size_t) stream*t->nb[2];
+            const size_t end   = off + t->nb[2];
+            // everything but the chunk of the last row reads as zeros again; zero the stream's part of that chunk
+            b.api->decommit(b.buf, off, t->nb[2] - t->nb[1]);
+            const size_t gran  = b.api->granularity(b.buf);
+            const size_t start = std::max(off, ((end - t->nb[1])/gran)*gran);
+            ggml_backend_tensor_memset(t, 0, start - t_off, end - start);
+        }
+    }
 }
 
 // Engram hashes the n-gram ending at each token, so a token shared by several sequences (llama-batched prompt)
@@ -1511,6 +1833,7 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
     const bool raw_per_seq  = kv_raw->get_base()->get_n_stream() != 1;
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
     const bool has_coupled = dsv4_batch_has_coupled(balloc.get_batch());
+    const uint32_t n_seqs_max = pool && !has_coupled && !dsv4_pool_batch_shared(balloc.get_batch()) ? 1 : 0;
 
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
@@ -1526,6 +1849,11 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
         }
 
         auto sinfos_raw_swa_read = dsv4_build_raw_read_sinfos(sinfos_raw_swa_write, ubatches);
+
+        // the shared pool has no room for the rows of this batch: no slot, as with a full cache
+        if (!pool_fits(ubatches, false) && (!pool_trim() || !pool_fits(ubatches, true))) {
+            return nullptr;
+        }
 
         return std::make_unique<llama_kv_cache_dsv4_context>(
                 this,
@@ -1550,7 +1878,7 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             } else {
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0, n_seqs_max);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -1725,6 +2053,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     for (const auto & buft_size : lid_state->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
+    if (pool) {
+        // the sparse streams take their budget of device memory, not their addressable size
+        for (const llama_kv_cache * kv : { kv_csa.get(), kv_hca.get() }) {
+            for (uint32_t il : kv->get_layer_ids()) {
+                const ggml_tensor * t = kv->get_k_storage(il);
+                if (t->buffer == nullptr) {
+                    continue;
+                }
+                auto & size = mb[ggml_backend_buffer_get_type(t->buffer)];
+                const size_t budget = std::min(ggml_nbytes(t), pool_tensor_budget(t));
+                size -= std::min(size, ggml_nbytes(t) - budget);
+            }
+        }
+    }
     return mb;
 }
 
@@ -1766,6 +2108,11 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     uint32_t magic;
     uint32_t version;
     uint32_t mode = DSV4_STATE_MODE_FULL;
+
+    // the shared pool: the rows committed ahead of the other sequences take budget that the rows read may need
+    if (pool && !pool_bufs.empty()) {
+        pool_trim();
+    }
 
     io.read(&magic,   sizeof(magic));
     io.read(&version, sizeof(version));
@@ -1902,6 +2249,25 @@ void llama_kv_cache_dsv4::refill_comp_mirrors() {
             ggml_tensor * t_dst = kv->get_k_storage(il);
             GGML_ASSERT(t_src->type == t_dst->type && ggml_are_same_shape(t_src, t_dst));
 
+            if (pool && llama_sparse_api_buf(t_dst->buffer)) {
+                // the rows of each sequence (the rest of a sparse stream reads as zeros on both sides)
+                const uint32_t ratio = kv == kv_csa.get() ? csa_state->get_ratio() : hca_state->get_ratio();
+                ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+                for (uint32_t s = 0; s < n_seq_max; ++s) {
+                    const size_t size = (size_t) pool_rows(kv_raw->seq_pos_max((llama_seq_id) s), ratio)*t_src->nb[1];
+                    if (size == 0) {
+                        continue;
+                    }
+                    GGML_ASSERT(dsv4_pool_commit_range(t_dst, (size_t) s*t_dst->nb[2], size));
+                    ggml_context_ptr ctx { ggml_init(params) };
+                    ggml_tensor * vs = ggml_view_1d(ctx.get(), t_src, size/ggml_element_size(t_src), (size_t) s*t_src->nb[2]);
+                    ggml_tensor * vd = ggml_view_1d(ctx.get(), t_dst, size/ggml_element_size(t_dst), (size_t) s*t_dst->nb[2]);
+                    GGML_ASSERT(ggml_backend_view_init(vs) == GGML_STATUS_SUCCESS && ggml_backend_view_init(vd) == GGML_STATUS_SUCCESS);
+                    ggml_backend_tensor_copy(vs, vd);
+                }
+                continue;
+            }
+
             ggml_backend_tensor_copy(t_src, t_dst);
         }
     }
@@ -1912,13 +2278,21 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         kv_csa->clear(data);
         kv_hca->clear(data);
         kv_lid->clear(data);
+        if (data && pool && !pool_bufs.empty()) {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                pool_release(kv_csa.get(), s);
+                pool_release(kv_hca.get(), s);
+            }
+        }
     } else {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
 
-        const auto clear_seq = [seq_id, data](llama_kv_cache * kv) {
+        const auto clear_seq = [this, seq_id, data](llama_kv_cache * kv) {
             kv->seq_rm(seq_id, -1, -1);
 
-            if (data) {
+            if (data && pool && !pool_bufs.empty() && (kv == kv_csa.get() || kv == kv_hca.get())) {
+                pool_release(kv, (uint32_t) seq_id);
+            } else if (data) {
                 //TODO: do not clear the kv-cache during `seq_rm`, ref: https://github.com/ggml-org/llama.cpp/pull/26490#discussion_r3798143663
                 for (uint32_t il : kv->get_layer_ids()) {
                     dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
@@ -1948,8 +2322,8 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
 // llama_kv_cache_dsv4_raw_context
 //
 
-static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv) {
-    const uint32_t n_stream = kv->get_n_stream();
+static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv, uint32_t ns = 0) {
+    const uint32_t n_stream = ns > 0 ? std::min(ns, kv->get_n_stream()) : kv->get_n_stream();
 
     llama_kv_cache::slot_info sinfo;
     sinfo.s0 = 0;
@@ -1961,6 +2335,14 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
     }
 
     return sinfo;
+}
+
+void llama_kv_cache_dsv4_raw_context::set_full_streams(uint32_t ns) const {
+    if (!ubatches.empty() || sinfos_read.size() != 1 || sinfos_read[0].n_stream() == std::min(ns, kv_swa->get_n_stream())) {
+        return;
+    }
+    sinfos_read[0] = dsv4_build_full_sinfo(kv_swa, ns);
+    sinfos_write   = sinfos_read;
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
@@ -2156,6 +2538,13 @@ bool llama_kv_cache_dsv4_comp_context::next() {
     return true;
 }
 
+void llama_kv_cache_dsv4_comp_context::set_full_streams(uint32_t ns) const {
+    if (!ubatches.empty() || sinfos.size() != 1) {
+        return;
+    }
+    sinfos[0] = dsv4_build_full_sinfo(kv, ns);
+}
+
 uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
     return n_kv;
 }
@@ -2292,6 +2681,12 @@ bool llama_kv_cache_dsv4_context::apply() {
 
     bool res = true;
 
+    // device memory for the rows this ubatch writes in the shared pool
+    if (!ubatches.empty() && kv->pool_enabled()) {
+        res = res & kv->pool_commit(ubatches[i_next],
+                plans_csa.empty() ? 0 : plans_csa[i_next].n_kv, plans_hca.empty() ? 0 : plans_hca[i_next].n_kv);
+    }
+
     res = res & ctx_raw->apply();
 
     if (ctx_csa_mem) {
@@ -2410,6 +2805,16 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     reserve_plan_csa = dsv4_build_reserve_comp_plan(
             ubatch, csa_state->get_ratio(), csa_state->is_overlap(),
             csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(), csa_state->get_n_rs_seq());
+
+    // the graph has the streams of the reserve ubatch: fewer than the cache when the prompt graph holds one
+    // sequence (the shared pool), view as many
+    {
+        const uint32_t ns = (uint32_t) reserve_plan_csa.n_stream;
+        ctx_raw->set_full_streams(ns);
+        ctx_csa->set_full_streams(ns);
+        ctx_hca->set_full_streams(ns);
+        ctx_lid->set_full_streams(ns);
+    }
 
     return reserve_plan_csa;
 }

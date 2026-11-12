@@ -125,6 +125,12 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // most sequences in a ubatch with several tokens per sequence (sizes the worst-case prompt graph)
+    virtual uint32_t get_n_seqs_pp_max(uint32_t n_seq_max) const { return n_seq_max; }
+
+    // tokens the sequences can still add together when they share one budget, -1 otherwise
+    virtual int32_t get_n_tokens_free() const { return -1; }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;

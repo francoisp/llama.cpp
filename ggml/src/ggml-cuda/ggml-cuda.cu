@@ -903,10 +903,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+struct ggml_cuda_sparse_state;
+static void ggml_cuda_sparse_free(ggml_cuda_sparse_state * sp);
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    ggml_cuda_sparse_state * sparse = nullptr; // a sparse buffer (virtual memory, committed on demand)
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -914,7 +918,11 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (sparse) {
+            ggml_cuda_sparse_free(sparse);
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -1116,10 +1124,16 @@ static bool ggml_backend_cuda_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer, 
     return true;
 }
 
+static void ggml_cuda_sparse_clear(ggml_cuda_sparse_state * sp, uint8_t value);
+
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->sparse) {
+        ggml_cuda_sparse_clear(ctx->sparse, value); // only the committed chunks, the rest reads as zeros
+        return;
+    }
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1237,6 +1251,261 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 
     return &ggml_backend_cuda_buffer_types[device];
 }
+
+// cuda sparse buffer type: a reserved virtual address range on which one zeroed chunk is mapped read-only
+// everywhere; ranges get their own zeroed device memory when committed, up to a budget. Used for the KV cache
+// streams of the sequences of a shared pool: each stream can grow to the whole context, the device memory
+// follows the tokens actually in the cache.
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+struct ggml_cuda_sparse_state {
+    int device;
+    int physical_device;
+    size_t granularity;
+    CUdeviceptr base = 0;
+    size_t va_size = 0;
+    size_t budget = SIZE_MAX;
+    CUmemGenericAllocationHandle dummy = 0;
+    std::vector<CUmemGenericAllocationHandle> chunks; // committed handle of each chunk, 0 = the dummy
+    std::vector<CUmemGenericAllocationHandle> spare;  // released chunks kept for the next commits
+    size_t n_committed = 0;
+    bool read_only_dummy = true;
+};
+
+static CUmemAllocationProp ggml_cuda_sparse_prop(int physical_device) {
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = physical_device;
+    return prop;
+}
+
+static void ggml_cuda_sparse_set_access(ggml_cuda_sparse_state * sp, CUdeviceptr ptr, size_t size, bool rw) {
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = sp->physical_device;
+    access.flags = rw || !sp->read_only_dummy ? CU_MEM_ACCESS_FLAGS_PROT_READWRITE : CU_MEM_ACCESS_FLAGS_PROT_READ;
+    CUresult err = cuMemSetAccess(ptr, size, &access, 1);
+    if (err != CUDA_SUCCESS && !rw && sp->read_only_dummy) {
+        // read-only device mappings are not supported everywhere: the dummy is then writable (writes are bugs)
+        GGML_LOG_WARN("%s: read-only mapping not supported, the zero chunk of sparse buffers is writable\n", __func__);
+        sp->read_only_dummy = false;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        err = cuMemSetAccess(ptr, size, &access, 1);
+    }
+    CU_CHECK(err);
+}
+
+static void ggml_cuda_sparse_free(ggml_cuda_sparse_state * sp) {
+    if (sp->base) {
+        ggml_cuda_set_device(sp->device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CU_CHECK(cuMemUnmap(sp->base, sp->va_size));
+        CU_CHECK(cuMemAddressFree(sp->base, sp->va_size));
+    }
+    for (CUmemGenericAllocationHandle h : sp->chunks) {
+        if (h) {
+            CU_CHECK(cuMemRelease(h));
+        }
+    }
+    for (CUmemGenericAllocationHandle h : sp->spare) {
+        CU_CHECK(cuMemRelease(h));
+    }
+    if (sp->dummy) {
+        CU_CHECK(cuMemRelease(sp->dummy));
+    }
+    delete sp;
+}
+
+static void ggml_cuda_sparse_clear(ggml_cuda_sparse_state * sp, uint8_t value) {
+    for (size_t i = 0; i < sp->chunks.size(); ++i) {
+        if (sp->chunks[i]) {
+            CUDA_CHECK(cudaMemsetAsync((void *) (sp->base + i*sp->granularity), value, sp->granularity, cudaStreamPerThread));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_sparse_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+    const int device = buft_ctx->device;
+
+    ggml_cuda_set_device(device);
+
+    ggml_cuda_sparse_state * sp = new ggml_cuda_sparse_state();
+    sp->device          = device;
+    sp->physical_device = ggml_cuda_get_physical_device(device);
+    sp->granularity     = ggml_cuda_info().devices[device].vmm_granularity;
+    sp->va_size         = std::max<size_t>(1, (size + sp->granularity - 1)/sp->granularity)*sp->granularity;
+    sp->chunks.assign(sp->va_size/sp->granularity, 0);
+
+    CUresult err = cuMemAddressReserve(&sp->base, sp->va_size, 0, 0, 0);
+    if (err != CUDA_SUCCESS) {
+        GGML_LOG_ERROR("%s: reserving %.2f MiB of virtual memory on device %d failed\n", __func__, sp->va_size/1024.0/1024.0, device);
+        sp->base = 0;
+        ggml_cuda_sparse_free(sp);
+        return nullptr;
+    }
+
+    // the zero chunk: zeroed through a writable mapping at the start, then mapped read-only everywhere
+    const CUmemAllocationProp prop = ggml_cuda_sparse_prop(sp->physical_device);
+    CU_CHECK(cuMemCreate(&sp->dummy, sp->granularity, &prop, 0));
+    CU_CHECK(cuMemMap(sp->base, sp->granularity, 0, sp->dummy, 0));
+    ggml_cuda_sparse_set_access(sp, sp->base, sp->granularity, true);
+    CUDA_CHECK(cudaMemset((void *) sp->base, 0, sp->granularity));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CU_CHECK(cuMemUnmap(sp->base, sp->granularity));
+    for (size_t i = 0; i < sp->chunks.size(); ++i) {
+        CU_CHECK(cuMemMap(sp->base + i*sp->granularity, sp->granularity, 0, sp->dummy, 0));
+    }
+    ggml_cuda_sparse_set_access(sp, sp->base, sp->va_size, false);
+
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) sp->base);
+    ctx->sparse = sp;
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+static ggml_cuda_sparse_state * ggml_cuda_sparse_of(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return nullptr;
+    }
+    return ((ggml_backend_cuda_buffer_context *) buffer->context)->sparse;
+}
+
+static size_t ggml_backend_cuda_sparse_granularity(ggml_backend_buffer_t buffer) {
+    ggml_cuda_sparse_state * sp = ggml_cuda_sparse_of(buffer);
+    return sp ? sp->granularity : 0;
+}
+
+static void ggml_backend_cuda_sparse_set_budget(ggml_backend_buffer_t buffer, size_t budget) {
+    ggml_cuda_sparse_state * sp = ggml_cuda_sparse_of(buffer);
+    if (sp) {
+        sp->budget = budget;
+    }
+}
+
+static size_t ggml_backend_cuda_sparse_committed(ggml_backend_buffer_t buffer) {
+    ggml_cuda_sparse_state * sp = ggml_cuda_sparse_of(buffer);
+    return sp ? sp->n_committed*sp->granularity : 0;
+}
+
+static size_t ggml_backend_cuda_sparse_missing(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_cuda_sparse_state * sp = ggml_cuda_sparse_of(buffer);
+    if (sp == nullptr || size == 0) {
+        return 0;
+    }
+    GGML_ASSERT(offset + size <= sp->va_size);
+    const size_t c0 = offset/sp->granularity;
+    const size_t c1 = (offset + size + sp->granularity - 1)/sp->granularity;
+    size_t n = 0;
+    for (size_t c = c0; c < c1; ++c) {
+        n += sp->chunks[c] == 0;
+    }
+    return n*sp->granularity;
+}
+
+static bool ggml_backend_cuda_sparse_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size, bool sync) {
+    ggml_cuda_sparse_state * sp = ggml_cuda_sparse_of(buffer);
+    if (sp == nullptr || size == 0) {
+        return sp == nullptr; // a regular buffer is all committed
+    }
+    GGML_ASSERT(offset + size <= sp->va_size);
+
+    const size_t c0 = offset/sp->granularity;
+    const size_t c1 = (offset + size + sp->granularity - 1)/sp->granularity;
+    size_t n_new = 0;
+    for (size_t c = c0; c < c1; ++c) {
+        n_new += sp->chunks[c] == 0;
+    }
+    if (n_new == 0) {
+        return true;
+    }
+    if ((sp->n_committed + n_new)*sp->granularity > sp->budget) {
+        return false;
+    }
+
+    // kernels still in flight may read the zero chunk at these addresses (padding past the end of a sequence)
+    ggml_cuda_set_device(sp->device);
+    if (sync) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    const CUmemAllocationProp prop = ggml_cuda_sparse_prop(sp->physical_device);
+    for (size_t c = c0; c < c1; ++c) {
+        if (sp->chunks[c]) {
+            continue;
+        }
+        CUmemGenericAllocationHandle h = 0;
+        if (!sp->spare.empty()) {
+            h = sp->spare.back();
+            sp->spare.pop_back();
+        } else {
+            CUresult err = cuMemCreate(&h, sp->granularity, &prop, 0);
+            if (err != CUDA_SUCCESS) {
+                GGML_LOG_ERROR("%s: device %d: out of memory committing a sparse buffer chunk\n", __func__, sp->device);
+                return false;
+            }
+        }
+        const CUdeviceptr ptr = sp->base + c*sp->granularity;
+        CU_CHECK(cuMemUnmap(ptr, sp->granularity));
+        CU_CHECK(cuMemMap(ptr, sp->granularity, 0, h, 0));
+        ggml_cuda_sparse_set_access(sp, ptr, sp->granularity, true);
+        CUDA_CHECK(cudaMemsetAsync((void *) ptr, 0, sp->granularity, cudaStreamPerThread));
+        sp->chunks[c] = h;
+        sp->n_committed++;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+}
+
+static void ggml_backend_cuda_sparse_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_cuda_sparse_state * sp = ggml_cuda_sparse_of(buffer);
+    if (sp == nullptr || size == 0) {
+        return;
+    }
+    GGML_ASSERT(offset + size <= sp->va_size);
+
+    // only the chunks wholly inside the range
+    const size_t c0 = (offset + sp->granularity - 1)/sp->granularity;
+    const size_t c1 = (offset + size)/sp->granularity;
+    bool synced = false;
+    for (size_t c = c0; c < c1; ++c) {
+        if (!sp->chunks[c]) {
+            continue;
+        }
+        if (!synced) {
+            ggml_cuda_set_device(sp->device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            synced = true;
+        }
+        const CUdeviceptr ptr = sp->base + c*sp->granularity;
+        CU_CHECK(cuMemUnmap(ptr, sp->granularity));
+        CU_CHECK(cuMemMap(ptr, sp->granularity, 0, sp->dummy, 0));
+        ggml_cuda_sparse_set_access(sp, ptr, sp->granularity, false);
+        sp->spare.push_back(sp->chunks[c]);
+        sp->chunks[c] = 0;
+        sp->n_committed--;
+    }
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_sparse_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name, // a CUDA buffer type for everything else
+    /* .alloc_buffer        = */ ggml_backend_cuda_sparse_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL,
+    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL,
+};
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_dev_sparse_buffer_type(ggml_backend_dev_t dev);
+#else
+struct ggml_cuda_sparse_state {};
+static void ggml_cuda_sparse_free(ggml_cuda_sparse_state * sp) { delete sp; }
+static void ggml_cuda_sparse_clear(ggml_cuda_sparse_state * sp, uint8_t value) { GGML_UNUSED(sp); GGML_UNUSED(value); }
+#endif // defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
@@ -6805,8 +7074,55 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+static ggml_backend_buffer_type_t ggml_backend_cuda_dev_sparse_buffer_type(ggml_backend_dev_t dev) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+    if (!initialized[device]) {
+        types[device] = {
+            /* .iface    = */ ggml_backend_cuda_sparse_buffer_type_interface,
+            /* .device   = */ dev,
+            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device, GGML_CUDA_NAME + std::to_string(device) + "_Sparse"},
+        };
+        initialized[device] = true;
+    }
+    return &types[device];
+}
+#endif // defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_dev_sparse_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_dev_sparse_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sparse_granularity") == 0) {
+        return (void *)ggml_backend_cuda_sparse_granularity;
+    }
+    if (strcmp(name, "ggml_backend_sparse_set_budget") == 0) {
+        return (void *)ggml_backend_cuda_sparse_set_budget;
+    }
+    if (strcmp(name, "ggml_backend_sparse_commit") == 0) {
+        return (void *)ggml_backend_cuda_sparse_commit;
+    }
+    if (strcmp(name, "ggml_backend_sparse_decommit") == 0) {
+        return (void *)ggml_backend_cuda_sparse_decommit;
+    }
+    if (strcmp(name, "ggml_backend_sparse_committed") == 0) {
+        return (void *)ggml_backend_cuda_sparse_committed;
+    }
+    if (strcmp(name, "ggml_backend_sparse_missing") == 0) {
+        return (void *)ggml_backend_cuda_sparse_missing;
+    }
+#endif // defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

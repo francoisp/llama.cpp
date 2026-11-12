@@ -840,6 +840,8 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // the prompt graph: as many sequences as the memory puts in a ubatch of several tokens per sequence
+    const uint32_t n_seqs_pp = memory ? std::max(1u, std::min(n_seqs, memory->get_n_seqs_pp_max(n_seqs))) : n_seqs;
 
     const size_t max_nodes = this->graph_max_nodes();
 
@@ -891,7 +893,7 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(),
                 model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
@@ -902,7 +904,7 @@ void llama_context::sched_reserve() {
                     /*.parallel   =*/ false,
                     /*.op_offload =*/ cparams.op_offload,
                 });
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -948,7 +950,7 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
+                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.no_alloc());
         };
 
         if (!gf) {
@@ -1114,7 +1116,7 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = std::max(1u, std::min(cparams.n_seq_max, memory->get_n_seqs_pp_max(cparams.n_seq_max)));
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -5067,6 +5069,14 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+int32_t llama_memory_n_tokens_free(llama_memory_t mem) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->get_n_tokens_free();
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

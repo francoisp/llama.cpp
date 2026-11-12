@@ -837,6 +837,10 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Tokens the sequences can still add together, for a memory whose sequences share one budget (the shared KV
+    // pool of DeepSeek V4.1, where the rows of idle sequences count as used); -1 if they do not share one
+    LLAMA_API int32_t llama_memory_n_tokens_free(llama_memory_t mem);
+
     //
     // State / sessions
     //
