@@ -608,11 +608,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
-            // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
             const int64_t n_tok = nt/n_stream;
             GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
-            const int64_t chunk = fused_idx ? n_tok :
-                std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
 
             const int32_t cand_src = hparams.dsv41_cand_src;
             const bool    pick_blk = cand_src == il && cand_pin;              // level one: pick the candidate blocks
@@ -625,8 +622,18 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // past the candidate budget, score only the keys of the source's blocks instead of masking a dense pass:
             // same scores for those keys, the rest were -inf (env LLAMA_DSV41_CAND_SCORING=0 restores the dense pass)
             static const bool cand_env = !getenv("LLAMA_DSV41_CAND_SCORING") || atoi(getenv("LLAMA_DSV41_CAND_SCORING")) != 0;
-            const bool cand_only = use_blk && fused_idx && cand_env && chunk == n_tok &&
+            const bool cand_only = use_blk && fused_idx && cand_env &&
                 n_blk > (int64_t) hparams.dsv41_cand_topk_blocks && n_comp <= (INT64_C(1) << 24);
+
+            // queries per chunk (the scores and the top-k of a query do not depend on the others): the unfused path keeps
+            // its [n_ih, tokens, n_comp] scores near 2^26 elements (at most 64 chunks), the fused indexer its F32
+            // [n_comp, tokens] scores (256 MiB, in multiples of 8 tokens: 4 chunks of 64 at 1M keys); the candidate
+            // scoring has small scores and runs as one chunk
+            // (LLAMA_DSV41_IDX_CHUNK_ELEMS sets the budget of the fused indexer in score elements)
+            static const int64_t idx_elems = getenv("LLAMA_DSV41_IDX_CHUNK_ELEMS") ? atoll(getenv("LLAMA_DSV41_IDX_CHUNK_ELEMS")) : (INT64_C(1) << 26);
+            const int64_t chunk = cand_only ? n_tok : fused_idx ?
+                std::min(n_tok, std::max<int64_t>(8, idx_elems/(n_comp*n_stream)/8*8)) :
+                std::max({ (n_tok + 63)/64, (INT64_C(1) << 26)/(n_idx_head*n_comp*n_stream), INT64_C(1) });
 
             ggml_tensor * ik_p = fused_idx ? nullptr : ggml_permute(ctx0, ik, 0, 2, 1, 3);
             std::vector<ggml_tensor *> parts_top_k;
@@ -661,7 +668,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_mask);
+                    if (nc == n_tok) {
+                        score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_mask);
+                    } else {
+                        ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
+                        score = ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), rows(comp_mask));
+                    }
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
@@ -842,8 +854,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             cb(comp_k, "comp_k", il);
             ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
-            ggml_tensor * sel_mask = build_top_k_mask(comp_mask, top_k, "comp_top_k_mask", il);
-            ggml_tensor * kq_mask  = ggml_concat(ctx0, raw_mask, sel_mask, 0);
+            // [window mask | top-k comp mask] in one op, without the full-length top-k mask that the concat reads and
+            // writes again per layer: half the mask memory at long context (env LLAMA_DSV41_MASK_PREFIX=0: the concat)
+            static const bool mask_prefix_env = dsv41_env_on("LLAMA_DSV41_MASK_PREFIX");
+            ggml_tensor * kq_mask = nullptr;
+            if (mask_prefix_env && cparams.fused_top_k_mask && raw_mask->type == comp_mask->type &&
+                    raw_mask->nb[0] == ggml_type_size(raw_mask->type) &&
+                    raw_mask->ne[1] == comp_mask->ne[1] && raw_mask->ne[2] == comp_mask->ne[2] && raw_mask->ne[3] == comp_mask->ne[3]) {
+                ggml_tensor * top_k_m = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], comp_mask->ne[1], comp_mask->ne[2], comp_mask->ne[3]);
+                kq_mask = ggml_top_k_mask_prefix(ctx0, raw_mask, comp_mask, top_k_m, nullptr, nullptr, nullptr);
+                res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, kq_mask, il});
+            } else {
+                ggml_tensor * sel_mask = build_top_k_mask(comp_mask, top_k, "comp_top_k_mask", il);
+                kq_mask = ggml_concat(ctx0, raw_mask, sel_mask, 0);
+            }
             cb(kq_mask, "comp_kq_mask", il);
 
             // at most window + top-k visible columns per query: lets CUDA FA gather only those

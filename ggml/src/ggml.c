@@ -6777,8 +6777,9 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
 // ggml_top_k_mask
 
-struct ggml_tensor * ggml_top_k_mask(
+static struct ggml_tensor * ggml_top_k_mask_impl(
         struct ggml_context * ctx,
+        struct ggml_tensor  * prefix,
         struct ggml_tensor  * mask,
         struct ggml_tensor  * top_k,
         struct ggml_tensor  * score,
@@ -6805,7 +6806,15 @@ struct ggml_tensor * ggml_top_k_mask(
         GGML_ASSERT(extra->ne[1] == top_k->ne[1] && extra->ne[2] == top_k->ne[2] && extra->ne[3] == top_k->ne[3]);
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, mask->type, mask->ne[0], top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+    int64_t n_pre = 0;
+    if (prefix) {
+        GGML_ASSERT(prefix->type == mask->type);
+        GGML_ASSERT(prefix->nb[0] == ggml_type_size(prefix->type));
+        GGML_ASSERT(top_k->ne[1] % prefix->ne[1] == 0 && top_k->ne[2] % prefix->ne[2] == 0 && top_k->ne[3] % prefix->ne[3] == 0);
+        n_pre = prefix->ne[0];
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, mask->type, n_pre + mask->ne[0], top_k->ne[1], top_k->ne[2], top_k->ne[3]);
 
     result->op     = GGML_OP_TOP_K_MASK;
     result->src[0] = mask;
@@ -6813,8 +6822,31 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+    result->src[5] = prefix;
 
     return result;
+}
+
+struct ggml_tensor * ggml_top_k_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra) {
+    return ggml_top_k_mask_impl(ctx, NULL, mask, top_k, score, blocks, extra);
+}
+
+struct ggml_tensor * ggml_top_k_mask_prefix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prefix,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra) {
+    GGML_ASSERT(prefix);
+    return ggml_top_k_mask_impl(ctx, prefix, mask, top_k, score, blocks, extra);
 }
 
 // ggml_prefix_mask

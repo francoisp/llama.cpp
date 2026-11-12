@@ -11664,10 +11664,12 @@ void ggml_compute_forward_top_k_mask(
     const ggml_tensor * score  = dst->src[2];
     const ggml_tensor * blocks = dst->src[3];
     const ggml_tensor * extra  = dst->src[4];
+    const ggml_tensor * prefix = dst->src[5];
 
     GGML_ASSERT(dst->type == mask->type);
     GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
 
+    const int64_t n_pre   = prefix ? prefix->ne[0] : 0;
     const int64_t n_kv    = mask->ne[0];
     const int64_t ne1     = dst->ne[1];
     const int64_t ne2     = dst->ne[2];
@@ -11690,6 +11692,13 @@ void ggml_compute_forward_top_k_mask(
         const char * mask_row = (const char *) mask->data
             + (i1 % mask->ne[1])*mask->nb[1] + (i2 % mask->ne[2])*mask->nb[2] + (i3 % mask->ne[3])*mask->nb[3];
         char * dst_row = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
+
+        if (prefix) {
+            const char * prefix_row = (const char *) prefix->data
+                + (i1 % prefix->ne[1])*prefix->nb[1] + (i2 % prefix->ne[2])*prefix->nb[2] + (i3 % prefix->ne[3])*prefix->nb[3];
+            memcpy(dst_row, prefix_row, n_pre*ts);
+            dst_row += n_pre*ts;
+        }
 
         if (dst->type == GGML_TYPE_F16) {
             const ggml_fp16_t ninf = GGML_CPU_FP32_TO_FP16(-INFINITY);

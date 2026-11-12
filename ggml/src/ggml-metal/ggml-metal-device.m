@@ -1886,7 +1886,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[2]) &&
                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
         case GGML_OP_TOP_K_MASK:
-            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+            return op->src[5] == nullptr && // no prefix rows
+                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                 op->src[0]->type == op->type &&
                 op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                 op->nb[0] == ggml_type_size(op->type) &&

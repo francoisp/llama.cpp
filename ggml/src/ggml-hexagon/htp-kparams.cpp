@@ -3471,6 +3471,10 @@ static bool htp_kparams_solve_top_k_mask(
     const struct ggml_tensor * extra  = op->src[4];
     const struct ggml_tensor * dst    = op;
 
+    if (op->src[5] != nullptr) {
+        return false; // prefix rows are not implemented
+    }
+
     if ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) || dst->type != mask->type) {
         return false;
     }

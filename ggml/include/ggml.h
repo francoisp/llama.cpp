@@ -2808,6 +2808,22 @@ extern "C" {
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
 
+    // ggml_top_k_mask with the rows of prefix in front: one op for concat(prefix, ggml_top_k_mask(...), 0)
+    //
+    // prefix: [n_pre, p1, p2, p3]  same type as mask, broadcast to the rows of top_k like mask
+    // res:    [n_pre + n_kv, ne1, ne2, ne3]
+    //
+    // res[c, i] = prefix[c, i % p] for c < n_pre, res[n_pre + c, i] = ggml_top_k_mask(...)[c, i]
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask_prefix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prefix,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
+
     // prefix attention mask: the first n_visible[i] cells of row i are visible
     //
     // n_visible: [ne1, ne2, ne3]       i32, contiguous

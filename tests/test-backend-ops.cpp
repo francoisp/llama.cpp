@@ -9869,9 +9869,10 @@ struct test_top_k_mask : public test_case {
     const int64_t ns;      // streams
     const bool    real;    // blocks of consecutive cells, live picks, as in a real cache
     const bool    bcast;   // one mask row for all rows and streams
+    const int64_t n_pre;   // 0: no prefix rows, else ggml_top_k_mask_prefix with an n_pre-cell prefix per row
 
     std::string vars() override {
-        return VARS_TO_STR12(type, n_kv, n_blk, n_pick, n_top, n_extra, score, nb, nh, ns, real, bcast);
+        return VARS_TO_STR13(type, n_kv, n_blk, n_pick, n_top, n_extra, score, nb, nh, ns, real, bcast, n_pre);
     }
 
     // the result is a copy of the mask or -inf, the harness checks the -inf pattern, the finite values must match exactly
@@ -9892,14 +9893,14 @@ struct test_top_k_mask : public test_case {
     size_t op_size(ggml_tensor * t) override {
         const size_t ts = ggml_type_size(type);
         const size_t nc = std::max<int64_t>(n_blk, 1);
-        return ggml_nbytes(t) + nb*nh*ns*(n_top*(sizeof(int32_t) + (score ? sizeof(float) : 0) + nc*(sizeof(int32_t) + 2*ts)) + n_extra*(sizeof(int32_t) + 2*ts));
+        return ggml_nbytes(t) + nb*nh*ns*(n_top*(sizeof(int32_t) + (score ? sizeof(float) : 0) + nc*(sizeof(int32_t) + 2*ts)) + n_extra*(sizeof(int32_t) + 2*ts) + n_pre*ts);
     }
 
     test_top_k_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 256, int64_t n_blk = 4, int64_t n_pick = 64,
             int64_t n_top = 16, int64_t n_extra = 3, bool score = true, int64_t nb = 32, int64_t nh = 1, int64_t ns = 1, bool real = false,
-            bool bcast = false)
+            bool bcast = false, int64_t n_pre = 0)
         : type(type), n_kv(n_kv), n_blk(n_blk), n_pick(n_blk ? n_pick : n_kv), n_top(n_top), n_extra(n_extra), score(score),
-          nb(nb), nh(nh), ns(ns), real(real), bcast(bcast) {}
+          nb(nb), nh(nh), ns(ns), real(real), bcast(bcast), n_pre(n_pre) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * m = bcast ? ggml_new_tensor_1d(ctx, type, n_kv) : ggml_new_tensor_4d(ctx, type, n_kv, nb, 1, ns);
@@ -9926,7 +9927,14 @@ struct test_top_k_mask : public test_case {
             ggml_set_name(extra, "extra");
         }
 
-        ggml_tensor * out = ggml_top_k_mask(ctx, m, top_k, s, blocks, extra);
+        ggml_tensor * out;
+        if (n_pre > 0) {
+            ggml_tensor * prefix = bcast ? ggml_new_tensor_1d(ctx, type, n_pre) : ggml_new_tensor_4d(ctx, type, n_pre, nb, 1, ns);
+            ggml_set_name(prefix, "prefix");
+            out = ggml_top_k_mask_prefix(ctx, prefix, m, top_k, s, blocks, extra);
+        } else {
+            out = ggml_top_k_mask(ctx, m, top_k, s, blocks, extra);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -9956,7 +9964,7 @@ struct test_top_k_mask : public test_case {
         };
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "m") == 0 || strcmp(t->name, "prefix") == 0) {
                 if (type == GGML_TYPE_F16) {
                     init_tensor_kq_mask(t);
                 } else {
@@ -10823,6 +10831,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // one mask row for all rows and streams (QSA)
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true));
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
+        // prefix rows in front (V4.1 window mask): aligned and unaligned prefix, per row and broadcast, with streams
+        test_cases.emplace_back(new test_top_k_mask(type, 4096, 0, 0, 512, 0, false, 32, 1, 1, false, false, 384));
+        test_cases.emplace_back(new test_top_k_mask(type, 1001, 0, 0, 64, 0, false, 7, 1, 3, false, false, 133));
+        test_cases.emplace_back(new test_top_k_mask(type, 1024, 4, 200, 32, 5, true, 9, 1, 2, false, false, 64));
+        test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true, 7));
+        test_cases.emplace_back(new test_top_k_mask(type, 512, 0, 0, 16, 0, false, 1, 1, 1, false, false, 256));
     }
 
     // glu ops

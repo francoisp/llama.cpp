@@ -12141,7 +12141,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_TOP_K:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32;
         case GGML_OP_TOP_K_MASK:
-            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+            return op->src[5] == nullptr && // no prefix rows
+                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                 op->src[0]->type == op->type &&
                 op->src[0]->nb[0] == ggml_type_size(op->type) && op->nb[0] == ggml_type_size(op->type) &&
                 op->src[1]->type == GGML_TYPE_I32 &&
