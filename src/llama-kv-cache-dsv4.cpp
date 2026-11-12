@@ -1254,7 +1254,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         return true;
     };
 
-    GGML_UNUSED(unified);
+    if (unified && n_seq_max > 1) {
+        LLAMA_LOG_WARN("%s: unified KV is not supported: every one of the %u sequences gets a stream for the whole context "
+                "(%u cells), use -np N without --kv-unified for N streams of n_ctx/N\n", __func__, n_seq_max, kv_size);
+    }
 
     // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
     const bool unified_raw = false;

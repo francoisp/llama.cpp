@@ -1215,6 +1215,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     if (arch.empty()) {
         return info;
     }
+    info.arch = arch;
 
     const int64_t type_id = gguf_find_key(gguf_ctx.get(), (arch + ".decision.type").c_str());
     if (type_id < 0) {

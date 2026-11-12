@@ -1003,6 +1003,7 @@ struct common_gguf_info {
     common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
     uint32_t             n_ctx_train   = 0;                            // 0 if unknown
     bool                 has_chat_tmpl = false;                        // has the default tokenizer.chat_template
+    std::string          arch;                                         // general.architecture, empty if unknown
 };
 
 common_gguf_info common_get_gguf_info(const std::string & fname);

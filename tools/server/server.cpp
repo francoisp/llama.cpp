@@ -124,10 +124,21 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+            // DeepSeek V4/V4.1 keep one KV stream per sequence: with unified KV every stream would be sized for the
+            // whole context (4 slots = 4x the memory, which pushes weights out of the devices), and without it 4
+            // slots would each get a quarter of the context. One slot keeps the context that was asked for.
+            const std::string arch = params.model.path.empty() ? std::string() : common_get_gguf_info(params.model.path).arch;
+            if (arch == "deepseek4" || arch == "deepseek41") {
+                SRV_INF("n_parallel is set to auto, using n_parallel = 1 for %s (one KV stream per slot, use -np N for N slots of n_ctx/N)\n", arch.c_str());
 
-            params.n_parallel = 4;
-            params.kv_unified = true;
+                params.n_parallel = 1;
+                params.kv_unified = false;
+            } else {
+                SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+
+                params.n_parallel = 4;
+                params.kv_unified = true;
+            }
         }
     }
 
