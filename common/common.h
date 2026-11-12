@@ -661,6 +661,10 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
+    // every name of the options given on the command line or by their environment variable, so that a tool can
+    // apply its own defaults to the others (e.g. the server's DeepSeek V4.1 defaults)
+    std::set<std::string> args_set;
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

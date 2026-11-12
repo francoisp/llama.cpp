@@ -789,10 +789,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    const auto mark_set = [&](const common_arg & opt) {
+        for (const char * a : opt.args)     { params.args_set.insert(a); }
+        for (const char * a : opt.args_neg) { params.args_set.insert(a); }
+    };
+
     // handle environment variables
     for (auto & opt : ctx_arg.options) {
         std::string value;
         if (opt.get_value_from_env(value)) {
+            mark_set(opt);
             try {
                 if (opt.handler_void && is_truthy(value)) {
                     opt.handler_void(params);
@@ -844,6 +850,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             auto & tmp = arg_to_options[arg];
             auto opt = *tmp.first;
             bool is_positive = tmp.second;
+            mark_set(opt);
             if (opt.has_value_from_env()) {
                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
             }

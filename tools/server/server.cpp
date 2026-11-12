@@ -111,6 +111,66 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
+// DeepSeek V4.1 on several GPUs: the settings measured best on 8x RTX 3090 at 512K+ context (see the server
+// README), applied to the options the user did not set
+static void server_apply_deepseek41_defaults(common_params & params) {
+    const auto is_set = [&](const char * name) { return params.args_set.count(name) > 0; };
+    std::vector<std::string> applied;
+
+    // 256-token ubatches: 15% faster prefill than 128 and small enough compute buffers for 512K context
+    if (!is_set("-ub")) {
+        params.n_ubatch = 256;
+        applied.push_back("-ub 256");
+    }
+
+    // 384 MiB free per device: room for the pipeline-parallel buffers next to a DSpark draft model at 512K context
+    if (!is_set("-fitt")) {
+        std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), (size_t) 384*1024*1024);
+        applied.push_back("-fitt 384");
+    }
+
+    // the draft model whole on the last GPU, which --fit gives the fewest target layers
+    const bool has_draft = !params.speculative.draft.mparams.path.empty();
+    if (has_draft && !is_set("-devd")) {
+        ggml_backend_dev_t last = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                last = dev;
+            }
+        }
+        if (last != nullptr && params.devices.empty()) {
+            params.speculative.draft.devices = { last, nullptr };
+            applied.push_back(std::string("-devd ") + ggml_backend_dev_name(last));
+        }
+    }
+    if (has_draft && !is_set("-ngld")) {
+        params.speculative.draft.n_gpu_layers = -2; // all
+        applied.push_back("-ngld all");
+    }
+
+    // 4 draft tokens: +8% decode over 3 at 131K (93% accepted), the same at 16K; 5 is slower
+    if (has_draft && !is_set("--spec-draft-n-max")) {
+        params.speculative.draft.n_max = 4;
+        applied.push_back("--spec-draft-n-max 4");
+    }
+
+    // the projector on the CPU: on a GPU it takes the room of expert weights, which slows every token down
+    // (an image takes 4-5 s on the CPU instead of about 1 s)
+    if (!params.mmproj.path.empty() && !is_set("--no-mmproj-offload")) {
+        params.mmproj_use_gpu = false;
+        applied.push_back("--no-mmproj-offload");
+    }
+
+    if (!applied.empty()) {
+        std::string s;
+        for (const auto & a : applied) {
+            s += (s.empty() ? "" : " ") + a;
+        }
+        SRV_INF("DeepSeek V4.1 defaults for the options not set: %s\n", s.c_str());
+    }
+}
+
 // adjust the params for the role; returns false on a configuration error
 static bool server_prepare_params(common_params & params, server_role_type role_type) {
     if (role_type != SERVER_ROLE_ROUTER) {
@@ -123,11 +183,16 @@ static bool server_prepare_params(common_params & params, server_role_type role_
             params.n_batch = params.n_ubatch;
         }
 
+        const std::string arch = params.model.path.empty() ? std::string() : common_get_gguf_info(params.model.path).arch;
+
+        if (arch == "deepseek41") {
+            server_apply_deepseek41_defaults(params);
+        }
+
         if (params.n_parallel < 0) {
             // DeepSeek V4/V4.1 keep one KV stream per sequence: with unified KV every stream would be sized for the
             // whole context (4 slots = 4x the memory, which pushes weights out of the devices), and without it 4
             // slots would each get a quarter of the context. One slot keeps the context that was asked for.
-            const std::string arch = params.model.path.empty() ? std::string() : common_get_gguf_info(params.model.path).arch;
             if (arch == "deepseek4" || arch == "deepseek41") {
                 SRV_INF("n_parallel is set to auto, using n_parallel = 1 for %s (one KV stream per slot, use -np N for N slots of n_ctx/N)\n", arch.c_str());
 

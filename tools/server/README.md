@@ -415,6 +415,41 @@ Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-cre
 
 If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
 
+### DeepSeek V4.1 on several GPUs
+
+The settings below were measured on 8 RTX 3090 / 3090 Ti (24 GB each) with the UD-IQ2_XXS quantization and the
+DSpark Q8_0 draft model, at 512K context:
+
+```sh
+llama-server -m DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+    -md dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf --spec-type draft-dspark \
+    --mmproj mmproj-F16.gguf -c 526000 -t 12 -tb 12
+```
+
+For a DeepSeek V4.1 model the server sets these when they are not given (on the command line or by their
+environment variable), and logs the ones it applied:
+
+| Default | Why |
+| --- | --- |
+| `-ub 256` | 15% faster prefill than 128, with compute buffers small enough for 512K context |
+| `-fitt 384` | leaves room on each GPU for the pipeline parallelism buffers next to the draft model; with 512 or more `--fit` falls back to the layout without pipeline parallelism |
+| `-np 1` (auto) | the V4 cache keeps one KV stream per slot: `-np N` gives N slots of `n_ctx/N`, `--kv-unified` would size every stream for the whole context |
+| `-devd <last GPU> -ngld all` | the draft model whole on the GPU that `--fit` gives the fewest layers |
+| `--spec-draft-n-max 4` | with DSpark: 8% faster decode than 3 at 131K (93% of the drafts accepted), the same at 16K; 5 is slower |
+| `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
+
+`-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` does not fit at 512K. Expected speeds with these settings:
+prefill 700-1000 t/s up to 131K (a 524K prompt in about 15 minutes), decode with drafts about 92 t/s at 131K and
+71 t/s at 524K.
+
+Prompt processing runs on all GPUs at once (pipeline parallelism: the next ubatch starts on the first GPU while the
+current one runs on the later ones). It is on with any multi-GPU layer split whose weights are all on the GPUs,
+including the layouts of `--fit`; if `--fit` has to keep weights in host memory it fits again without it.
+`LLAMA_PIPELINE_PARALLEL=0` turns it off, `GGML_SCHED_N_COPIES` (default 2, at most 4) sets how many ubatches are in
+flight. While other slots generate, prompts are processed one ubatch at a time (`--prefill-share`), so that the
+generating slots keep going. Speculative decoding can be turned off for the whole server with `POST /speculative`
+(or the toggle in the web UI), and pauses by itself while 3 or more slots generate (`--spec-max-slots`).
+
 ## Build
 
 `llama-server` is built alongside everything else from the root of the project
