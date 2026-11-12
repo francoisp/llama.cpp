@@ -1046,6 +1046,11 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 //
 
 struct server_context_impl {
+    // prompt processing next to generating slots, see params_base.prefill_share
+    int64_t prefill_debt_us   = 0;     // decode-only time owed to the generating slots before the next prompt chunk
+    bool    batch_mixed       = false; // the current batch holds prompt tokens next to tokens of generating slots
+    bool    batch_decode_only = false; // the current batch was held back from prompts to pay off prefill_debt_us
+    int32_t batch_n_gen       = 0;     // tokens of generating slots in the current batch
     friend struct server_context;
 
 public:
@@ -3813,6 +3818,10 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // a step with prompt tokens next to generating slots earns them decode-only time, see pre_decode()
+        batch_mixed = batch_n_gen > 0 && batch.size() > batch_n_gen && params_base.prefill_share < 1.0f;
+        const int64_t t_step_start_us = ggml_time_us();
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3851,6 +3860,18 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+        }
+
+        const int64_t t_step_us = ggml_time_us() - t_step_start_us;
+        if (batch_mixed || batch_decode_only) {
+            SRV_DBG("step: n_tokens = %d, n_gen = %d, mixed = %d, decode only = %d, t = %.1f ms, owed = %.1f ms\n", batch.size(),
+                batch_n_gen, (int) batch_mixed, (int) batch_decode_only, t_step_us/1e3, prefill_debt_us/1e3);
+        }
+        if (batch_mixed) {
+            const float share = params_base.prefill_share;
+            prefill_debt_us += (int64_t) (t_step_us * (1.0f - share) / share);
+        } else if (batch_decode_only) {
+            prefill_debt_us = std::max<int64_t>(0, prefill_debt_us - t_step_us);
         }
     }
 
@@ -4165,6 +4186,33 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // A prompt filling whole batches next to generating slots holds each of their tokens for the whole batch
+        // (2048 tokens of a large model can take seconds). While any slot generates, prompts are added at most one
+        // ubatch at a time and, after such a step, the generating slots get decode-only steps for the time
+        // (1 - prefill_share)/prefill_share times that step took, see update_slots().
+        const int32_t n_batch_gen = batch.size(); // sampled and drafted tokens of the generating slots
+        int32_t n_batch_prompt = n_batch;         // the batch size that prompt tokens may fill up to
+
+        batch_mixed       = false;
+        batch_decode_only = false;
+        batch_n_gen       = n_batch_gen;
+
+        {
+            bool has_prompt = false;
+            for (const auto & slot : slots) {
+                has_prompt = has_prompt || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED;
+            }
+
+            if (n_batch_gen == 0 || !has_prompt || params_base.prefill_share >= 1.0f) {
+                prefill_debt_us = 0;
+            } else if (prefill_debt_us > 0) {
+                n_batch_prompt    = n_batch_gen;
+                batch_decode_only = true;
+            } else {
+                n_batch_prompt = std::min(n_batch, std::max(n_ubatch, n_batch_gen + 1));
+            }
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -4173,7 +4221,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4675,7 +4723,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

@@ -2547,6 +2547,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--prefill-share"}, "F",
+        string_format("while some slots generate, prompts are processed one ubatch at a time and get this share of the time,\n"
+            "the generating slots get decode-only steps for the rest (0 < F <= 1, 1 = prompts fill whole batches, default: %.2f)",
+            (double) params.prefill_share),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f > 0.0f && f <= 1.0f)) {
+                throw std::invalid_argument("--prefill-share must be in (0, 1]");
+            }
+            params.prefill_share = f;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_SHARE"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",

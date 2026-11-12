@@ -587,6 +587,7 @@ struct common_params {
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
+    float prefill_share    = 0.5f;  // share of the time prompt processing gets while other slots generate (1 = all it can take)
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
