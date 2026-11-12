@@ -431,7 +431,7 @@ environment variable), and logs the ones it applied:
 
 | Default | Why |
 | --- | --- |
-| `-ub 256` | 15% faster prefill than 128, with compute buffers small enough for 512K context; `--fit` uses 128 when 256 would leave weights in host memory (1M context) |
+| `-ub 256` | 15% faster prefill than 128, with compute buffers small enough for 512K context; `--fit` uses 128 when 256 would leave weights in host memory |
 | `-fitt 384` | leaves room on each GPU for the pipeline parallelism buffers next to the draft model; with 512 or more `--fit` falls back to the layout without pipeline parallelism |
 | `-np 4 --kv-unified` (auto) | the shared KV pool (below): 4 slots share the context, each can grow to all of it |
 | `-devd <last GPU> -ngld all` | the draft model whole on the GPU that `--fit` gives the fewest layers |
@@ -442,9 +442,12 @@ environment variable), and logs the ones it applied:
 prefill 700-1000 t/s up to 131K (a 524K prompt in about 15 minutes), decode with drafts about 92 t/s at 131K and
 71 t/s at 524K.
 
-The whole 1M context of the model fits too (`-c 1048576`, same command otherwise): `--fit` then uses `-ub 128` and
-keeps every weight on the 8 GPUs, with the draft model and pipeline parallelism. A 950K prompt takes 29 minutes
-(542 t/s), decode with drafts stays at about 70 t/s at 950K.
+The whole 1M context of the model fits too (`-c 1048576`, same command otherwise), with `-ub 256`, every weight on the
+8 GPUs, the draft model and pipeline parallelism. A 950K prompt takes 26 minutes (612 t/s), decode with drafts stays
+at about 71 t/s at 950K. At that length `--fit` sizes the layout to the smaller prompt graph, in which the indexer and
+the sparse attention mask read the count of visible compressed rows of each token instead of a 512 MiB mask
+(`LLAMA_DSV41_MASK_COUNT=0` turns this off); up to 512K it keeps the layout of the larger graph, which spreads the
+layers for faster prefill, and the run just has more free memory.
 
 Prompt processing runs on all GPUs at once (pipeline parallelism: the next ubatch starts on the first GPU while the
 current one runs on the later ones). It is on with any multi-GPU layer split whose weights are all on the GPUs,

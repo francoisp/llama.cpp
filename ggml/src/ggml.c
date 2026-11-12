@@ -6571,18 +6571,25 @@ struct ggml_tensor * ggml_lightning_indexer(
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
-    GGML_ASSERT(   mask->ne[1] == q->ne[2]);
     GGML_ASSERT(      q->ne[2] == weights->ne[1]);
     GGML_ASSERT(weights->ne[2] == 1);
-    GGML_ASSERT(   mask->ne[2] == 1);
     GGML_ASSERT(      q->ne[3] == k->ne[3]);
     GGML_ASSERT(      k->ne[3] == weights->ne[3]);
-    GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+    if (mask->type == GGML_TYPE_I32) {
+        // the number of visible keys of each row
+        GGML_ASSERT(mask->nb[0] == sizeof(int32_t));
+        GGML_ASSERT(mask->ne[0] == q->ne[2] && mask->ne[1] == 1 && mask->ne[3] == 1);
+        GGML_ASSERT(weights->ne[3] % mask->ne[2] == 0);
+    } else {
+        GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+        GGML_ASSERT(   mask->ne[1] == q->ne[2]);
+        GGML_ASSERT(   mask->ne[2] == 1);
+        GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+    }
 
     int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -6609,18 +6616,25 @@ struct ggml_tensor * ggml_lightning_indexer_cand(
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
-    GGML_ASSERT(   mask->ne[1] == q->ne[2]);
     GGML_ASSERT(      q->ne[2] == weights->ne[1]);
     GGML_ASSERT(weights->ne[2] == 1);
-    GGML_ASSERT(   mask->ne[2] == 1);
     GGML_ASSERT(      q->ne[3] == k->ne[3]);
     GGML_ASSERT(      k->ne[3] == weights->ne[3]);
-    GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+    if (mask->type == GGML_TYPE_I32) {
+        // the number of visible keys of each row
+        GGML_ASSERT(mask->nb[0] == sizeof(int32_t));
+        GGML_ASSERT(mask->ne[0] == q->ne[2] && mask->ne[1] == 1 && mask->ne[3] == 1);
+        GGML_ASSERT(weights->ne[3] % mask->ne[2] == 0);
+    } else {
+        GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+        GGML_ASSERT(   mask->ne[1] == q->ne[2]);
+        GGML_ASSERT(   mask->ne[2] == 1);
+        GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+    }
 
     GGML_ASSERT(cand->type == GGML_TYPE_I32);
     GGML_ASSERT(block_size > 0);
@@ -6804,14 +6818,21 @@ static struct ggml_tensor * ggml_top_k_mask_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * prefix,
         struct ggml_tensor  * mask,
+        int64_t               n_kv_count, // > 0: mask is the I32 count of the visible keys of each row, of n_kv_count keys
         struct ggml_tensor  * top_k,
         struct ggml_tensor  * score,
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra) {
-    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
-    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
-    GGML_ASSERT(top_k->ne[1] % mask->ne[1] == 0 && top_k->ne[2] % mask->ne[2] == 0 && top_k->ne[3] % mask->ne[3] == 0);
+    if (n_kv_count > 0) {
+        GGML_ASSERT(prefix && (prefix->type == GGML_TYPE_F16 || prefix->type == GGML_TYPE_F32));
+        GGML_ASSERT(mask->type == GGML_TYPE_I32 && mask->nb[0] == sizeof(int32_t) && mask->ne[3] == 1);
+        GGML_ASSERT(top_k->ne[1] % mask->ne[0] == 0 && top_k->ne[2] % mask->ne[1] == 0 && top_k->ne[3] % mask->ne[2] == 0);
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+        GGML_ASSERT(top_k->ne[1] % mask->ne[1] == 0 && top_k->ne[2] % mask->ne[2] == 0 && top_k->ne[3] % mask->ne[3] == 0);
+    }
 
     if (score) {
         GGML_ASSERT(score->type == GGML_TYPE_F32);
@@ -6831,13 +6852,15 @@ static struct ggml_tensor * ggml_top_k_mask_impl(
 
     int64_t n_pre = 0;
     if (prefix) {
-        GGML_ASSERT(prefix->type == mask->type);
+        GGML_ASSERT(n_kv_count > 0 || prefix->type == mask->type);
         GGML_ASSERT(prefix->nb[0] == ggml_type_size(prefix->type));
         GGML_ASSERT(top_k->ne[1] % prefix->ne[1] == 0 && top_k->ne[2] % prefix->ne[2] == 0 && top_k->ne[3] % prefix->ne[3] == 0);
         n_pre = prefix->ne[0];
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, mask->type, n_pre + mask->ne[0], top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+    const enum ggml_type type = n_kv_count > 0 ? prefix->type : mask->type;
+    const int64_t        n_kv = n_kv_count > 0 ? n_kv_count : mask->ne[0];
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_pre + n_kv, top_k->ne[1], top_k->ne[2], top_k->ne[3]);
 
     result->op     = GGML_OP_TOP_K_MASK;
     result->src[0] = mask;
@@ -6857,7 +6880,7 @@ struct ggml_tensor * ggml_top_k_mask(
         struct ggml_tensor  * score,
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra) {
-    return ggml_top_k_mask_impl(ctx, NULL, mask, top_k, score, blocks, extra);
+    return ggml_top_k_mask_impl(ctx, NULL, mask, 0, top_k, score, blocks, extra);
 }
 
 struct ggml_tensor * ggml_top_k_mask_prefix(
@@ -6869,7 +6892,20 @@ struct ggml_tensor * ggml_top_k_mask_prefix(
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra) {
     GGML_ASSERT(prefix);
-    return ggml_top_k_mask_impl(ctx, prefix, mask, top_k, score, blocks, extra);
+    return ggml_top_k_mask_impl(ctx, prefix, mask, 0, top_k, score, blocks, extra);
+}
+
+struct ggml_tensor * ggml_top_k_mask_prefix_count(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prefix,
+        struct ggml_tensor  * n_visible,
+        int64_t               n_kv,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra) {
+    GGML_ASSERT(prefix && n_kv > 0);
+    return ggml_top_k_mask_impl(ctx, prefix, n_visible, n_kv, top_k, score, blocks, extra);
 }
 
 // ggml_prefix_mask

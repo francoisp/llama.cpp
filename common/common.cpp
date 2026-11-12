@@ -1279,6 +1279,26 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         return false;
     };
     const bool pp_env = getenv("LLAMA_PIPELINE_PARALLEL") != nullptr;
+    // with fit_large_graph the first layout is fitted to the prompt graph without its memory-saving variants
+    // (LLAMA_FIT_LARGE_GRAPH=1 while fitting, see deepseek41): when that layout keeps every weight on the devices it is
+    // kept and the run just has more free memory; the saved memory changes the layer split, which costs speed when
+    // nothing needed it (DeepSeek V4.1 on 8 GPUs at 526K: 3.5% prefill). Only when weights would stay in host memory
+    // is the smaller graph fitted.
+    bool large_graph = params.fit_large_graph && getenv("LLAMA_FIT_LARGE_GRAPH") == nullptr;
+    const auto set_large_graph = [](bool on) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_FIT_LARGE_GRAPH", on ? "1" : "");
+#else
+        if (on) {
+            setenv("LLAMA_FIT_LARGE_GRAPH", "1", 1);
+        } else {
+            unsetenv("LLAMA_FIT_LARGE_GRAPH");
+        }
+#endif
+    };
+    if (large_graph) {
+        set_large_graph(true);
+    }
     const llama_model_params   mparams0     = mparams;
     const llama_context_params cparams0     = cparams;
     const llama_model_params   mparams_dft0 = mparams_dft;
@@ -1294,12 +1314,19 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
-        const uint32_t n_ubatch = cparams.n_ubatch/2;
-        if (params.fit_ubatch_min <= 0 || n_ubatch < (uint32_t) params.fit_ubatch_min ||
-                !keeps_host_weights(params.tensor_buft_overrides.data())) {
-            break;
+        const bool spill = keeps_host_weights(params.tensor_buft_overrides.data());
+        uint32_t n_ubatch = cparams.n_ubatch;
+        if (spill && large_graph) {
+            large_graph = false;
+            set_large_graph(false);
+            COM_INF("%s", "the layout keeps weights in host memory, fitting again with the smaller prompt graph\n");
+        } else {
+            n_ubatch /= 2;
+            if (!spill || params.fit_ubatch_min <= 0 || n_ubatch < (uint32_t) params.fit_ubatch_min) {
+                break;
+            }
+            COM_INF("the layout keeps weights in host memory, fitting again with -ub %u\n", n_ubatch);
         }
-        COM_INF("the layout keeps weights in host memory, fitting again with -ub %u\n", n_ubatch);
         mparams     = mparams0;
         cparams     = cparams0;
         mparams_dft = mparams_dft0;
@@ -1314,6 +1341,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 #endif
         }
         cparams.n_ubatch = params.n_ubatch = n_ubatch;
+    }
+    if (large_graph) {
+        set_large_graph(false);
     }
 }
 

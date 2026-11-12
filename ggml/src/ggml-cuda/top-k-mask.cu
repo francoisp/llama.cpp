@@ -6,7 +6,7 @@
 // one block per row: copy the prefix row, fill the rest with -inf, then copy the mask cells of the live picks and the extra cells
 template <typename T>
 static __global__ void top_k_mask_kernel(
-        const T * mask, const int32_t * top_k, const float * score, const int32_t * blocks, const int32_t * extra,
+        const T * mask, const int32_t * count, const int32_t * top_k, const float * score, const int32_t * blocks, const int32_t * extra,
         const T * prefix, T * dst, const int64_t n_pre,
         const int64_t p1, const int64_t p2, const int64_t p3, const int64_t sp1, const int64_t sp2, const int64_t sp3,
         const int64_t n_kv, const int64_t ne1, const int64_t ne2,
@@ -26,11 +26,15 @@ static __global__ void top_k_mask_kernel(
     const int64_t i2 = (ir / ne1) % ne2;
     const int64_t i3 = ir / (ne1*ne2);
 
-    const T       * mask_row  = mask  + (i1 % m1)*sm1 + (i2 % m2)*sm2 + (i3 % m3)*sm3;
+    // count: the number of visible keys of each row instead of mask cells (ggml_top_k_mask_prefix_count)
+    const int64_t   im        = (i1 % m1)*sm1 + (i2 % m2)*sm2 + (i3 % m3)*sm3;
+    const T       * mask_row  = count ? nullptr : mask + im;
     T             * dst_row   = dst   + i1*sd1 + i2*sd2 + i3*sd3;
     const int32_t * top_k_row = top_k + i1*sk1 + i2*sk2 + i3*sk3;
 
     ggml_cuda_pdl_sync();
+
+    const int32_t n_vis = count ? count[im] : 0;
 
     if (n_pre > 0) {
         const T * prefix_row = prefix + (i1 % p1)*sp1 + (i2 % p2)*sp2 + (i3 % p3)*sp3;
@@ -48,6 +52,8 @@ static __global__ void top_k_mask_kernel(
     }
 
     const T ninf = ggml_cuda_cast<T>(-INFINITY);
+    const T zero = ggml_cuda_cast<T>(0.0f);
+    const auto cell = [&](const int64_t c) { return count ? (c < n_vis ? zero : ninf) : mask_row[c]; };
     if (vec) {
         constexpr int nv = sizeof(int4)/sizeof(T);
         T fill[nv];
@@ -72,7 +78,7 @@ static __global__ void top_k_mask_kernel(
         if (i >= n_top) {
             const int32_t c = extra[(i - n_top)*se0 + i1*se1 + i2*se2 + i3*se3];
             if (c >= 0 && c < n_kv) {
-                dst_row[c] = mask_row[c];
+                dst_row[c] = cell(c);
             }
             continue;
         }
@@ -86,14 +92,14 @@ static __global__ void top_k_mask_kernel(
         }
         if (!blocks) {
             if (p < n_kv) {
-                dst_row[p] = mask_row[p];
+                dst_row[p] = cell(p);
             }
             continue;
         }
         for (int64_t k = 0; k < n_blk; ++k) {
             const int32_t c = blocks[k*sb0 + p*sb1];
             if (c >= 0 && c < n_kv) {
-                dst_row[c] = mask_row[c];
+                dst_row[c] = cell(c);
             }
         }
     }
@@ -108,11 +114,14 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const ggml_tensor * extra  = dst->src[4];
     const ggml_tensor * prefix = dst->src[5];
 
-    const int64_t n_kv  = mask->ne[0];
-    const int64_t n_pre = prefix ? prefix->ne[0] : 0;
+    // an I32 mask is the number of visible keys of each row [m1, m2, m3] (ggml_top_k_mask_prefix_count)
+    const bool    m_count = mask->type == GGML_TYPE_I32;
+    const int64_t n_pre   = prefix ? prefix->ne[0] : 0;
+    const int64_t n_kv    = m_count ? dst->ne[0] - n_pre : mask->ne[0];
+    const size_t  sm      = m_count ? sizeof(int32_t) : sizeof(T);
 
-    GGML_ASSERT(dst->nb[0] == sizeof(T) && mask->nb[0] == sizeof(T));
-    GGML_ASSERT(dst->nb[1] % sizeof(T) == 0 && mask->nb[1] % sizeof(T) == 0);
+    GGML_ASSERT(dst->nb[0] == sizeof(T) && mask->nb[0] == sm);
+    GGML_ASSERT(dst->nb[1] % sizeof(T) == 0 && mask->nb[1] % sm == 0);
     GGML_ASSERT(!prefix || (prefix->nb[0] == sizeof(T) && prefix->nb[1] % sizeof(T) == 0 &&
         prefix->nb[2] % sizeof(T) == 0 && prefix->nb[3] % sizeof(T) == 0));
 
@@ -135,7 +144,7 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     ggml_cuda_kernel_launch(top_k_mask_kernel<T>, launch_params,
-            (const T *) mask->data, (const int32_t *) top_k->data,
+            m_count ? nullptr : (const T *) mask->data, m_count ? (const int32_t *) mask->data : nullptr, (const int32_t *) top_k->data,
             score  ? (const float   *) score->data  : nullptr,
             blocks ? (const int32_t *) blocks->data : nullptr,
             extra  ? (const int32_t *) extra->data  : nullptr,
@@ -144,9 +153,9 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             prefix ? prefix->ne[1] : 1, prefix ? prefix->ne[2] : 1, prefix ? prefix->ne[3] : 1,
             prefix ? prefix->nb[1]/sizeof(T) : 0, prefix ? prefix->nb[2]/sizeof(T) : 0, prefix ? prefix->nb[3]/sizeof(T) : 0,
             n_kv, dst->ne[1], dst->ne[2],
-            mask->ne[1], mask->ne[2], mask->ne[3],
+            m_count ? mask->ne[0] : mask->ne[1], m_count ? mask->ne[1] : mask->ne[2], m_count ? mask->ne[2] : mask->ne[3],
             top_k->ne[0], n_pick, blocks ? blocks->ne[0] : 1, extra ? extra->ne[0] : 0,
-            mask->nb[1]/sizeof(T), mask->nb[2]/sizeof(T), mask->nb[3]/sizeof(T),
+            (m_count ? mask->nb[0] : mask->nb[1])/sm, (m_count ? mask->nb[1] : mask->nb[2])/sm, (m_count ? mask->nb[2] : mask->nb[3])/sm,
             dst->nb[1]/sizeof(T),  dst->nb[2]/sizeof(T),  dst->nb[3]/sizeof(T),
             top_k->nb[0]/si, top_k->nb[1]/si, top_k->nb[2]/si, top_k->nb[3]/si,
             score  ? score->nb[0]/sf  : 0, score ? score->nb[1]/sf : 0, score ? score->nb[2]/sf : 0, score ? score->nb[3]/sf : 0,

@@ -11685,11 +11685,13 @@ void ggml_compute_forward_top_k_mask(
     const ggml_tensor * extra  = dst->src[4];
     const ggml_tensor * prefix = dst->src[5];
 
-    GGML_ASSERT(dst->type == mask->type);
+    // an I32 mask is the number of visible keys of each row (ggml_top_k_mask_prefix_count)
+    const bool m_count = mask->type == GGML_TYPE_I32;
+    GGML_ASSERT(m_count || dst->type == mask->type);
     GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
 
     const int64_t n_pre   = prefix ? prefix->ne[0] : 0;
-    const int64_t n_kv    = mask->ne[0];
+    const int64_t n_kv    = m_count ? dst->ne[0] - n_pre : mask->ne[0];
     const int64_t ne1     = dst->ne[1];
     const int64_t ne2     = dst->ne[2];
     const int64_t n_rows  = ggml_nrows(dst);
@@ -11708,8 +11710,10 @@ void ggml_compute_forward_top_k_mask(
         const int64_t i2 = (ir / ne1) % ne2;
         const int64_t i3 = ir / (ne1*ne2);
 
-        const char * mask_row = (const char *) mask->data
+        const char * mask_row = m_count ? nullptr : (const char *) mask->data
             + (i1 % mask->ne[1])*mask->nb[1] + (i2 % mask->ne[2])*mask->nb[2] + (i3 % mask->ne[3])*mask->nb[3];
+        const int32_t n_vis = m_count ? *(const int32_t *) ((const char *) mask->data
+            + (i1 % mask->ne[0])*mask->nb[0] + (i2 % mask->ne[1])*mask->nb[1] + (i3 % mask->ne[2])*mask->nb[2]) : 0;
         char * dst_row = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
 
         if (prefix) {
@@ -11732,7 +11736,13 @@ void ggml_compute_forward_top_k_mask(
 
         auto keep = [&](int32_t c) {
             if (c >= 0 && c < n_kv) {
-                memcpy(dst_row + c*ts, mask_row + c*ts, ts);
+                if (!m_count) {
+                    memcpy(dst_row + c*ts, mask_row + c*ts, ts);
+                } else if (dst->type == GGML_TYPE_F16) {
+                    ((ggml_fp16_t *) dst_row)[c] = GGML_CPU_FP32_TO_FP16(c < n_vis ? 0.0f : -INFINITY);
+                } else {
+                    ((float *) dst_row)[c] = c < n_vis ? 0.0f : -INFINITY;
+                }
             }
         };
 
@@ -12486,7 +12496,9 @@ void ggml_compute_forward_lightning_indexer(
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
     GGML_ASSERT(   w->type == GGML_TYPE_F32);
-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+    GGML_ASSERT(   m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_I32);
+    // an I32 mask is the number of visible keys of each row [n_tokens, 1, ne33]: keys c < n are visible
+    const bool m_count = m->type == GGML_TYPE_I32;
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
@@ -12531,7 +12543,8 @@ void ggml_compute_forward_lightning_indexer(
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens; ++t) {
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
-            const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+            const ggml_fp16_t *   m_row = m_count ? nullptr : (ggml_fp16_t *) ((char *) m->data + t*nbm1 + (s%nem3)*nbm3);
+            const int32_t         n_vis = m_count ? *(const int32_t *) ((const char *) m->data + t*nbm0 + (s%nem2)*nbm2) : 0;
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             for (int ik = ir0; ik < ir1; ++ik) {
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
@@ -12550,7 +12563,7 @@ void ggml_compute_forward_lightning_indexer(
                     score += MAX(qk, 0.0f) * w_row[h];
                 }
                 // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[ik] = score + (m_count ? (ik < n_vis ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(m_row[ik]));
             }
         }
     }
@@ -12571,7 +12584,9 @@ void ggml_compute_forward_lightning_indexer_cand(
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
     GGML_ASSERT(   w->type == GGML_TYPE_F32);
-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+    GGML_ASSERT(   m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_I32);
+    // an I32 mask is the number of visible keys of each row [n_tokens, 1, ne33]: keys c < n are visible
+    const bool m_count = m->type == GGML_TYPE_I32;
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
@@ -12617,7 +12632,8 @@ void ggml_compute_forward_lightning_indexer_cand(
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens; ++t) {
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
-            const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+            const ggml_fp16_t *   m_row = m_count ? nullptr : (ggml_fp16_t *) ((char *) m->data + t*nbm1 + (s%nem3)*nbm3);
+            const int32_t         n_vis = m_count ? *(const int32_t *) ((const char *) m->data + t*nbm0 + (s%nem2)*nbm2) : 0;
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             const int32_t     *   c_row =     (int32_t *) ((char *)   c->data + t*c->nb[1] +  s*c->nb[3]);
             for (int j = ir0; j < ir1; ++j) {
@@ -12642,7 +12658,7 @@ void ggml_compute_forward_lightning_indexer_cand(
                     score += MAX(qk, 0.0f) * w_row[h];
                 }
                 // apply mask
-                dst_row[j] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[j] = score + (m_count ? (ik < n_vis ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(m_row[ik]));
             }
         }
     }

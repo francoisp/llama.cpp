@@ -583,11 +583,28 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     } else {
         const int64_t n_comp = ci.kq_mask->ne[0];
 
-        ggml_tensor * comp_mask = comp_kq_mask(model, ci, il);
-
         ggml_tensor * comp_all = comp_ctx->get_k(ctx0, rd);
         GGML_ASSERT(comp_all->ne[0] == n_embd_head + n_idx_embd && n_comp <= comp_all->ne[2]);
         const int64_t n_stream = comp_all->ne[3];
+
+        // the visible compressed rows of each token: the fused ops take their count (I32 [n_tok, 1, n_stream]) instead
+        // of the [n_comp, n_tok] mask (512 MiB per GPU at 1M context and 256-token ubatches), which is then built only
+        // for the other paths (env LLAMA_DSV41_MASK_COUNT=0: the mask everywhere)
+        // --fit measuring the larger prompt graph first (LLAMA_FIT_LARGE_GRAPH, common_fit_apply) sizes the mask
+        static const bool mask_count_env = dsv41_env_on("LLAMA_DSV41_MASK_COUNT");
+        const bool fit_large = model.no_alloc() && getenv("LLAMA_FIT_LARGE_GRAPH") != nullptr;
+        ggml_tensor * comp_vis = mask_count_env && !fit_large && ci.n_visible && ci.kq_mask->type == GGML_TYPE_F16 ? ci.n_visible : nullptr;
+        ggml_tensor * comp_mask_t = nullptr;
+        const auto comp_mask = [&]() {
+            if (comp_mask_t == nullptr) {
+                comp_mask_t = comp_kq_mask(model, ci, il);
+            }
+            return comp_mask_t;
+        };
+        // the counts of tokens [t0, t0 + nc)
+        const auto rows_vis = [&](int64_t t0, int64_t nc) {
+            return ggml_view_3d(ctx0, comp_vis, nc, 1, n_stream, comp_vis->nb[1], comp_vis->nb[2], t0*comp_vis->nb[0]);
+        };
 
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
         if (hparams.dsv41_topk_src[il] == il) {
@@ -648,7 +665,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     const int64_t k_b  = bsel->ne[0];
                     const int64_t n_r  = nc*n_stream;
 
-                    ggml_tensor * sc = ggml_lightning_indexer_cand(ctx0, iq, ik, iw, comp_mask, bsel, (int) bs);
+                    ggml_tensor * sc = ggml_lightning_indexer_cand(ctx0, iq, ik, iw, comp_vis ? comp_vis : comp_mask(), bsel, (int) bs);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
                     cb(sc, "idx_score_cand", il);
                     ggml_tensor * loc = ggml_top_k(ctx0, sc, std::min<int64_t>(k_b*bs, hparams.indexer_top_k));
@@ -669,10 +686,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
                     if (nc == n_tok) {
-                        score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_mask);
+                        score = ggml_lightning_indexer(ctx0, iq, ik, iw, comp_vis ? comp_vis : comp_mask());
                     } else {
                         ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
-                        score = ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), rows(comp_mask));
+                        score = ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), comp_vis ? rows_vis(t0, nc) : rows(comp_mask()));
                     }
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
@@ -681,7 +698,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
                     score = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_relu(ctx0, kq), rows(iw)));
-                    ggml_tensor * mask  = rows(comp_mask);
+                    ggml_tensor * mask  = rows(comp_mask());
                     score = ggml_add(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)),
                             mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
                 }
@@ -821,7 +838,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // window mask, then the comp mask at the selected rows (-inf where top-k picked an invisible row); one per top-k source
             ggml_tensor *& kq_mask = gather_mask_of[topk_src];
             if (!kq_mask) {
-                ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, comp_mask, 1, n_comp, nt), sel);
+                ggml_tensor * sel_mask = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, comp_mask(), 1, n_comp, nt), sel);
                 sel_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, sel_mask, k_sel, 1, 1, nt), GGML_TYPE_F16);
                 kq_mask = ggml_concat(ctx0, ggml_reshape_4d(ctx0, raw_mask, raw_mask->ne[0], 1, 1, nt), sel_mask, 0);
                 cb(kq_mask, "comp_kq_mask_sel", il);
@@ -864,14 +881,17 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // writes again per layer: half the mask memory at long context (env LLAMA_DSV41_MASK_PREFIX=0: the concat)
             static const bool mask_prefix_env = dsv41_env_on("LLAMA_DSV41_MASK_PREFIX");
             ggml_tensor * kq_mask = nullptr;
-            if (mask_prefix_env && cparams.fused_top_k_mask && raw_mask->type == comp_mask->type &&
+            const ggml_tensor * cm = ci.kq_mask; // the shape of the compressed mask
+            if (mask_prefix_env && cparams.fused_top_k_mask && raw_mask->type == cm->type &&
                     raw_mask->nb[0] == ggml_type_size(raw_mask->type) &&
-                    raw_mask->ne[1] == comp_mask->ne[1] && raw_mask->ne[2] == comp_mask->ne[2] && raw_mask->ne[3] == comp_mask->ne[3]) {
-                ggml_tensor * top_k_m = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], comp_mask->ne[1], comp_mask->ne[2], comp_mask->ne[3]);
-                kq_mask = ggml_top_k_mask_prefix(ctx0, raw_mask, comp_mask, top_k_m, nullptr, nullptr, nullptr);
+                    raw_mask->ne[1] == cm->ne[1] && raw_mask->ne[2] == cm->ne[2] && raw_mask->ne[3] == cm->ne[3]) {
+                ggml_tensor * top_k_m = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], cm->ne[1], cm->ne[2], cm->ne[3]);
+                kq_mask = comp_vis ?
+                    ggml_top_k_mask_prefix_count(ctx0, raw_mask, comp_vis, n_comp, top_k_m, nullptr, nullptr, nullptr) :
+                    ggml_top_k_mask_prefix(ctx0, raw_mask, comp_mask(), top_k_m, nullptr, nullptr, nullptr);
                 res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, kq_mask, il});
             } else {
-                ggml_tensor * sel_mask = build_top_k_mask(comp_mask, top_k, "comp_top_k_mask", il);
+                ggml_tensor * sel_mask = build_top_k_mask(comp_mask(), top_k, "comp_top_k_mask", il);
                 kq_mask = ggml_concat(ctx0, raw_mask, sel_mask, 0);
             }
             cb(kq_mask, "comp_kq_mask", il);

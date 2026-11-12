@@ -1831,6 +1831,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
                 return false;
             }
+            // a mask given as the count of visible keys (I32) is not supported
+            if (op->src[3]->type != GGML_TYPE_F16) {
+                return false;
+            }
             if (!has_simdgroup_mm ||
                 op->src[0]->type != GGML_TYPE_F32 ||
                 op->src[2]->type != GGML_TYPE_F32 ||

@@ -2719,6 +2719,7 @@ extern "C" {
     // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
     // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
     // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    //      or  [n_batch,    1,          ne33]          i32, the number of visible keys of each row (keys c < n)
     // res:     [n_kv,       n_batch,    1,       ne3 ]
     //
     // broadcast:
@@ -2828,6 +2829,22 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * prefix,
             struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
+
+    // ggml_top_k_mask_prefix with a prefix mask given by count instead of cells: of the n_kv keys, those below
+    // n_visible[i] are visible in row i (0, -inf otherwise), without the [n_kv, ...] mask
+    //
+    // n_visible: [m1, m2, m3]  i32, broadcast to the rows of top_k
+    // res:       [n_pre + n_kv, ne1, ne2, ne3] of the type of prefix
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask_prefix_count(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prefix,
+            struct ggml_tensor  * n_visible,
+            int64_t               n_kv,
             struct ggml_tensor  * top_k,
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,

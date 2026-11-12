@@ -502,6 +502,8 @@ struct common_params {
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
     int32_t fit_ubatch_min     = 0;     // > 0: n_ubatch was set by a tool's defaults, --fit may halve it down to this
                                         // value rather than keep weights in host memory
+    bool    fit_large_graph    = false; // --fit measures the larger prompt graph first (LLAMA_FIT_LARGE_GRAPH), see
+                                        // common_fit_apply
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

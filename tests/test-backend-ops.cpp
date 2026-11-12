@@ -10080,6 +10080,125 @@ struct test_top_k_mask : public test_case {
     }
 };
 
+// counts of visible keys (I32), keys c < n of a row are visible: random, with rows that see nothing, all, or past the end
+static void init_tensor_visible_counts(ggml_tensor * t, int64_t n_kv) {
+    GGML_ASSERT(t->type == GGML_TYPE_I32);
+    std::mt19937 gen(0x5649);
+    std::uniform_int_distribution<int32_t> dis(0, (int32_t) n_kv);
+    std::vector<int32_t> data(ggml_nelements(t));
+    for (size_t i = 0; i < data.size(); ++i) {
+        const uint32_t r = gen() % 12;
+        data[i] = r == 0 ? 0 : r == 1 ? (int32_t) n_kv : r == 2 ? (int32_t) n_kv + 5 : r == 3 ? -2 : dis(gen);
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+}
+
+// GGML_OP_LIGHTNING_INDEXER with the mask given as the count of visible keys of each row (I32 [nb, 1, nm])
+struct test_lightning_indexer_count : public test_lightning_indexer {
+    using test_lightning_indexer::test_lightning_indexer;
+
+    std::string vars() override {
+        return test_lightning_indexer::vars() + ",count=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+        ggml_tensor * m = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nb, 1, nm);
+        ggml_set_name(m, "m_count");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_lightning_indexer::initialize_tensors(ctx);
+        init_tensor_visible_counts(ggml_get_tensor(ctx, "m_count"), kv);
+    }
+};
+
+// GGML_OP_LIGHTNING_INDEXER_CAND with the mask given as the count of visible keys of each row
+struct test_lightning_indexer_cand_count : public test_lightning_indexer_cand {
+    using test_lightning_indexer_cand::test_lightning_indexer_cand;
+
+    std::string vars() override {
+        return test_lightning_indexer_cand::vars() + ",count=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+        ggml_tensor * m = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nb, 1, nm);
+        ggml_set_name(m, "m_count");
+        ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_cand, nb, 1, ns);
+        ggml_set_name(c, "c");
+
+        ggml_tensor * out = ggml_lightning_indexer_cand(ctx, q, k, w, m, c, (int) bsz);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_lightning_indexer_cand::initialize_tensors(ctx);
+        init_tensor_visible_counts(ggml_get_tensor(ctx, "m_count"), kv);
+    }
+};
+
+// ggml_top_k_mask_prefix_count: the mask cells given as the count of visible keys of each row
+struct test_top_k_mask_count : public test_top_k_mask {
+    using test_top_k_mask::test_top_k_mask;
+
+    std::string vars() override {
+        return test_top_k_mask::vars() + ",count=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(n_pre > 0);
+        ggml_tensor * m = bcast ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1) : ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nb, 1, ns);
+        ggml_set_name(m, "m_count");
+
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top, nb, nh, ns);
+        ggml_set_name(top_k, "top_k");
+
+        ggml_tensor * s = nullptr;
+        if (score) {
+            s = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_pick, nb, nh, ns);
+            ggml_set_name(s, "score");
+        }
+        ggml_tensor * blocks = nullptr;
+        if (n_blk > 0) {
+            blocks = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blk, n_pick);
+            ggml_set_name(blocks, "blocks");
+        }
+        ggml_tensor * extra = nullptr;
+        if (n_extra > 0) {
+            extra = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_extra, nb, nh, ns);
+            ggml_set_name(extra, "extra");
+        }
+
+        ggml_tensor * prefix = bcast ? ggml_new_tensor_1d(ctx, type, n_pre) : ggml_new_tensor_4d(ctx, type, n_pre, nb, 1, ns);
+        ggml_set_name(prefix, "prefix");
+
+        ggml_tensor * out = ggml_top_k_mask_prefix_count(ctx, prefix, m, n_kv, top_k, s, blocks, extra);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_top_k_mask::initialize_tensors(ctx);
+        init_tensor_visible_counts(ggml_get_tensor(ctx, "m_count"), n_kv);
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -10910,6 +11029,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 1024, 4, 200, 32, 5, true, 9, 1, 2, false, false, 64));
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true, 7));
         test_cases.emplace_back(new test_top_k_mask(type, 512, 0, 0, 16, 0, false, 1, 1, 1, false, false, 256));
+        // the mask given as counts (DeepSeek V4.1: window prefix, top-k picks of the compressed rows)
+        test_cases.emplace_back(new test_top_k_mask_count(type, 4096, 0, 0, 512, 0, false, 32, 1, 1, false, false, 384));
+        test_cases.emplace_back(new test_top_k_mask_count(type, 1001, 0, 0, 64, 0, false, 7, 1, 3, false, false, 133));
+        test_cases.emplace_back(new test_top_k_mask_count(type, 1024, 4, 200, 32, 5, true, 9, 1, 2, false, false, 64));
+        test_cases.emplace_back(new test_top_k_mask_count(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true, 7));
     }
 
     // glu ops
@@ -13633,6 +13757,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the mask given as the count of visible keys of each row
+    for (int bs : { 1, 8, 512 }) {
+        for (int nh : { 4, 32, 64 }) {
+            for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
+                for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                    test_cases.emplace_back(new test_lightning_indexer_count(128, nh, 1003, bs, ns, nm, type_K));
+                }
+            }
+        }
+    }
+
     // lightning_indexer_cand
     for (int nh : { 32, 64 }) {
         for (int nb : { 1, 3, 128 }) {
@@ -13644,6 +13779,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_lightning_indexer_cand(128, 32, 70000, 2, 1, 1, 2048, 8, GGML_TYPE_F16));
+    for (int nb : { 1, 3, 128 }) {
+        for (auto [ns, nm] : { std::pair{1, 1}, std::pair{2, 1}, std::pair{2, 2} }) {
+            test_cases.emplace_back(new test_lightning_indexer_cand_count(128, 64, 1003, nb, ns, nm, 20, 8, GGML_TYPE_F16));
+        }
+    }
 
     return test_cases;
 }

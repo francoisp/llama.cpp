@@ -149,6 +149,10 @@ static void server_apply_deepseek41_defaults(common_params & params) {
         applied.push_back("-ub 256 (128 if needed to fit)");
     }
 
+    // the layer split of the larger prompt graph while it fits: the memory the smaller graph saves moves layers between
+    // the GPUs, which slows prefill by 3.5% at 526K; it is used when weights would stay in host memory (1M context)
+    params.fit_large_graph = true;
+
     // 384 MiB free per device: room for the pipeline-parallel buffers next to a DSpark draft model at 512K context
     if (!is_set("-fitt")) {
         std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), (size_t) 384*1024*1024);
