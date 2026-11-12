@@ -1265,13 +1265,56 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
     };
 
-    common_fit_params(params.model.get_paths(), &mparams, &cparams,
-        params.tensor_split,
-        params.tensor_buft_overrides.data(),
-        params.fit_params_target.data(),
-        params.fit_params_min_ctx,
-        has_draft || spec_mtp ? &extra : nullptr,
-        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    // a ubatch size from a tool's defaults (fit_ubatch_min > 0): the prompt graph buffers grow with the ubatch and the
+    // context, so when the layout keeps weights in host memory, fit again with half the ubatch (down to fit_ubatch_min)
+    // before giving the weights up. DeepSeek V4.1 at 1M context: -ub 256 leaves 9 GB of weights in host memory,
+    // -ub 128 keeps them all on 8 GPUs with pipeline parallelism.
+    const auto keeps_host_weights = [](const llama_model_tensor_buft_override * o) {
+        for (; o && o->pattern; ++o) {
+            ggml_backend_dev_t dev = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
+            if (!o->buft || ggml_backend_buft_is_host(o->buft) || !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool pp_env = getenv("LLAMA_PIPELINE_PARALLEL") != nullptr;
+    const llama_model_params   mparams0     = mparams;
+    const llama_context_params cparams0     = cparams;
+    const llama_model_params   mparams_dft0 = mparams_dft;
+    const llama_context_params cparams_dft0 = cparams_dft;
+    const std::vector<float>   split0(params.tensor_split, params.tensor_split + 128);
+    const auto                 overrides0   = params.tensor_buft_overrides;
+    while (true) {
+        common_fit_params(params.model.get_paths(), &mparams, &cparams,
+            params.tensor_split,
+            params.tensor_buft_overrides.data(),
+            params.fit_params_target.data(),
+            params.fit_params_min_ctx,
+            has_draft || spec_mtp ? &extra : nullptr,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        const uint32_t n_ubatch = cparams.n_ubatch/2;
+        if (params.fit_ubatch_min <= 0 || n_ubatch < (uint32_t) params.fit_ubatch_min ||
+                !keeps_host_weights(params.tensor_buft_overrides.data())) {
+            break;
+        }
+        COM_INF("the layout keeps weights in host memory, fitting again with -ub %u\n", n_ubatch);
+        mparams     = mparams0;
+        cparams     = cparams0;
+        mparams_dft = mparams_dft0;
+        cparams_dft = cparams_dft0;
+        std::copy(split0.begin(), split0.end(), params.tensor_split);
+        params.tensor_buft_overrides = overrides0;
+        if (!pp_env) {
+#ifdef _WIN32
+            _putenv_s("LLAMA_PIPELINE_PARALLEL", "");
+#else
+            unsetenv("LLAMA_PIPELINE_PARALLEL");
+#endif
+        }
+        cparams.n_ubatch = params.n_ubatch = n_ubatch;
+    }
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :

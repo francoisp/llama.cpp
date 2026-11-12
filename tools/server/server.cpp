@@ -141,10 +141,12 @@ static void server_apply_deepseek41_defaults(common_params & params) {
     const auto is_set = [&](const char * name) { return params.args_set.count(name) > 0; };
     std::vector<std::string> applied;
 
-    // 256-token ubatches: 15% faster prefill than 128 and small enough compute buffers for 512K context
+    // 256-token ubatches: 15% faster prefill than 128 and small enough compute buffers for 512K context; --fit
+    // halves them (to 128) rather than keep weights in host memory, as at 1M context
     if (!is_set("-ub")) {
-        params.n_ubatch = 256;
-        applied.push_back("-ub 256");
+        params.n_ubatch       = 256;
+        params.fit_ubatch_min = 128;
+        applied.push_back("-ub 256 (128 if needed to fit)");
     }
 
     // 384 MiB free per device: room for the pipeline-parallel buffers next to a DSpark draft model at 512K context
