@@ -201,6 +201,7 @@ export { default as ChatFormActionReasoning } from './ChatForm/ChatFormActions/C
  * Dropdown that loads or unloads a directional steering vector on the server.
  * Renders nothing unless the server offers vectors.
  */
+export { default as ChatFormActionSpeculative } from './ChatForm/ChatFormActions/ChatFormActionSpeculative.svelte';
 export { default as ChatFormActionSteering } from './ChatForm/ChatFormActions/ChatFormActionSteering.svelte';
 
 /**

@@ -1046,6 +1046,13 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 //
 
 struct server_context_impl {
+    // speculative decoding for the whole server (GET/POST /speculative), read when a task starts
+    std::atomic<bool> spec_on{true};
+
+    bool has_spec() const {
+        return spec != nullptr;
+    }
+
     // prompt processing next to generating slots, see params_base.prefill_share
     int64_t prefill_debt_us   = 0;     // decode-only time owed to the generating slots before the next prompt chunk
     bool    batch_mixed       = false; // the current batch holds prompt tokens next to tokens of generating slots
@@ -2291,6 +2298,9 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        // speculative decoding is a server-wide setting, a request cannot turn it on or off for itself
+        task.params.spec_enabled = spec_on.load();
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -4146,6 +4156,13 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // with several slots generating, verifying all their drafts costs more than the drafts save: plain cycles
+        int32_t n_slots_generating = 0;
+        for (const auto & slot : slots) {
+            n_slots_generating += slot.state == SLOT_STATE_GENERATING;
+        }
+        const bool spec_busy = params_base.speculative.max_slots > 0 && n_slots_generating >= params_base.speculative.max_slots;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -4172,6 +4189,11 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 int n_draft_max = slot.get_n_draft_max();
+
+                if (n_draft_max > 0 && slot.spec_draft.empty() && spec_busy) {
+                    // a plain cycle: the drafter still gets the target features through process()
+                    n_draft_max = 0;
+                }
 
                 if (n_draft_max > 0 && slot.spec_draft.empty() && slot.spec_gate_skip > 0) {
                     // a plain cycle: the drafter still gets the target features through process()
@@ -7021,6 +7043,34 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    // speculative decoding on or off for the whole server; takes effect for the tasks that start afterwards
+    const auto speculative_state = [this]() {
+        return json {
+            {"enabled",   ctx_server.spec_on.load()},
+            {"available", ctx_server.has_spec()},
+            {"max_slots", params.speculative.max_slots},
+        };
+    };
+
+    this->get_speculative = [this, speculative_state](const server_http_req &) {
+        auto res = create_response();
+        res->ok(speculative_state());
+        return res;
+    };
+
+    this->post_speculative = [this, speculative_state](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.is_object() || !body.contains("enabled") || !body.at("enabled").is_boolean()) {
+            res->error(format_error_response("Request body must be an object with a boolean \"enabled\"", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        ctx_server.spec_on = body.at("enabled").get<bool>();
+        SRV_INF("speculative decoding %s for new tasks\n", ctx_server.spec_on.load() ? "enabled" : "disabled");
+        res->ok(speculative_state());
         return res;
     };
 

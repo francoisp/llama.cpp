@@ -229,6 +229,15 @@ export interface ApiSteeringState {
 	available: ApiSteeringVector[];
 }
 
+export interface ApiSpeculativeState {
+	// drafts for the tasks that start from now on, on every slot
+	enabled: boolean;
+	// the server has a draft model
+	available: boolean;
+	// no drafting while this many slots generate at once (0 = no limit)
+	max_slots: number;
+}
+
 export interface ApiLlamaCppServerProps {
 	default_generation_settings: {
 		id: number;

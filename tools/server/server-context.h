@@ -140,6 +140,8 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t get_steering;
     server_http_context::handler_t post_steering;
+    server_http_context::handler_t get_speculative;
+    server_http_context::handler_t post_speculative;
 
     // to be used in router mode
     json get_model_info() const;

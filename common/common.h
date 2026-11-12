@@ -397,6 +397,9 @@ struct common_params_speculative {
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
+    // the server drafts only while fewer slots than this generate at the same time (0 = no limit)
+    int32_t max_slots = 3;
+
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
     common_params_speculative_ngram_map ngram_map_k;

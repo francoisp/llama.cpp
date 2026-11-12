@@ -4,6 +4,7 @@
 		ChatFormActionReasoning,
 		ChatFormActionRecord,
 		ChatFormActionsAdd,
+		ChatFormActionSpeculative,
 		ChatFormActionSteering,
 		ChatFormActionSubmit,
 		ChatFormContextGauge,
@@ -150,6 +151,8 @@
 		{/if}
 
 		{#if showModelSelector}
+			<ChatFormActionSpeculative {disabled} />
+
 			<ChatFormActionSteering disabled={disabled || isLoading} />
 
 			<ChatFormActionReasoning />

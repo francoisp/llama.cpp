@@ -264,6 +264,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
 | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
+| `--spec-max-slots N` | draft only while fewer than N slots generate at the same time: verifying the drafts of several slots<br/>costs more than they save (0 = no limit, default: 3)<br/>(env: LLAMA_ARG_SPEC_MAX_SLOTS) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
 | `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
@@ -600,7 +601,7 @@ These words will not be included in the completion, so make sure to add them to 
 
 `return_tokens`: Return the raw generated token ids in the `tokens` field. Otherwise `tokens` remains empty. Default: `false`
 
-`speculative`: Use the server's speculative decoding for this request, if it was started with one. With `false` the request generates one token at a time, and a DSpark draft model (`--spec-type draft-dspark`) also skips its per-token work: when a later request turns it back on, the draft model catches up from the last positions of the cached prompt. Default: `true`
+`speculative`: Ignored. Speculative decoding is set for the whole server, see `GET/POST /speculative`.
 
 `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]` - these are all the available values.
 
@@ -1302,6 +1303,20 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
     "n_erased": 1745
 }
 ```
+
+### GET `/speculative`: Get whether speculative decoding is on
+
+Returns `enabled`, whether new requests use the server's speculative decoding, `available`, whether the
+server was started with a draft model, and `max_slots` (`--spec-max-slots`): while that many slots
+generate at the same time, no slot drafts, as verifying all their drafts costs more than they save
+(0 = no limit). The web UI shows a toggle on the chat form when `available` is `true`.
+
+### POST `/speculative`: Turn speculative decoding on or off for the whole server
+
+Body: `{ "enabled": false }`. The setting applies to the requests that start afterwards, on every
+slot; requests that are already generating keep the setting they started with. A DSpark draft model
+(`--spec-type draft-dspark`) skips its per-token work while it is off and catches up from the last
+positions of the cached prompt when it is turned back on. Returns the same object as `GET`.
 
 ### GET `/steering`: Get the current directional steering
 
