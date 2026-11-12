@@ -7,7 +7,10 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <vector>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
@@ -1073,8 +1076,52 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    // the layouts are measured with pipeline parallelism on (multi-GPU layer split), which needs room for its input
+    // copies. If the layout still keeps weights in host memory, the context runs without pipeline parallelism
+    // (op offload would copy those weights into every input copy), so fit again without it: its room goes to the
+    // weights. The context then also runs without it (LLAMA_PIPELINE_PARALLEL=0 set here; a value set by the user
+    // is kept and no second fit is made)
+    const bool pp_user = getenv("LLAMA_PIPELINE_PARALLEL") != nullptr;
+    const llama_model_params   mparams0 = *mparams;
+    const llama_context_params cparams0 = *cparams;
+    std::vector<float> tensor_split0;
+    if (tensor_split) {
+        tensor_split0.assign(tensor_split, tensor_split + llama_max_devices());
+    }
+    std::vector<llama_model_tensor_buft_override> overrides0;
+    if (tensor_buft_overrides) {
+        overrides0.assign(tensor_buft_overrides, tensor_buft_overrides + llama_max_tensor_buft_overrides());
+    }
+    const auto host_overrides = [&]() {
+        for (const auto * o = tensor_buft_overrides; o && o->pattern; ++o) {
+            ggml_backend_dev_t dev = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
+            if (!o->buft || ggml_backend_buft_is_host(o->buft) || !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     try {
         common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        if (!pp_user && cparams->op_offload && host_overrides()) {
+            LOG_INF("%s: the layout keeps weights in host memory, fitting again without pipeline parallelism\n", __func__);
+#ifdef _WIN32
+            _putenv_s("LLAMA_PIPELINE_PARALLEL", "0");
+#else
+            setenv("LLAMA_PIPELINE_PARALLEL", "0", 1);
+#endif
+            *mparams = mparams0;
+            *cparams = cparams0;
+            if (tensor_split) {
+                std::copy(tensor_split0.begin(), tensor_split0.end(), tensor_split);
+            }
+            if (tensor_buft_overrides) {
+                std::copy(overrides0.begin(), overrides0.end(), tensor_buft_overrides);
+            }
+            common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        }
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

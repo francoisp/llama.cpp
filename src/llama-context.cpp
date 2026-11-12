@@ -598,12 +598,17 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // overrides that keep weights on the GPUs are fine (as the --fit layouts): only host weights that GPU ops
+        // read (op offload) would be copied into every input copy of the splits that use them. --fit measures its
+        // layouts without op offload, so it sees the pipeline buffers of the final layout
+        const char * pp_env = getenv("LLAMA_PIPELINE_PARALLEL"); // 0: off (read per context: --fit may set it)
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides() &&
+            !(model.has_host_tensor_overrides() && cparams.op_offload) &&
+            !(pp_env && atoi(pp_env) == 0) &&
             cparams.moe_cache_size == 0; // not supported by the MoE cache
 
         // pipeline parallelism requires support for async compute and events in all devices
@@ -1905,7 +1910,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // with pipeline parallelism the scheduler moves to its next input copy only when it splits a graph:
+    // prompt ubatches take a new split each so that they overlap on the devices, decode keeps the reused graph
+    // (env LLAMA_PP_SPLIT_MIN: the smallest ubatch that takes a new split, 0 = never)
+    static const int pp_split_min = getenv("LLAMA_PP_SPLIT_MIN") ? atoi(getenv("LLAMA_PP_SPLIT_MIN")) : 64;
+    const bool pp_new_split = cparams.pipeline_parallel && pp_split_min > 0 && (int) ubatch.n_tokens >= pp_split_min;
+
+    if (!graph_reuse_disable && !pp_new_split && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         n_reused++;

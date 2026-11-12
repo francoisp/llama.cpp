@@ -455,6 +455,26 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
+    // keep an op on the device of its layer: the scheduler may give the ops after the last weight of a layer to the
+    // next device, so a full-length [n_comp, tokens] input would cross devices (once per input copy with pipeline
+    // parallelism) where a reduced one would do (env LLAMA_DSV41_PIN_CAND=0 leaves them to the scheduler)
+    static const bool pin_env = dsv41_env_on("LLAMA_DSV41_PIN_CAND");
+    const auto on_layer_dev = [&](ggml_tensor * t, int il_dev) {
+        ggml_backend_dev_t dev = model.dev_layer(il_dev);
+        if (!pin_env || dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return;
+        }
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(b) == dev) {
+                if (ggml_backend_supports_op(b, t)) {
+                    ggml_backend_sched_set_tensor_backend(sched, t, b);
+                }
+                return;
+            }
+        }
+    };
+
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
@@ -660,8 +680,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     ggml_tensor * s2 = ggml_reshape_2d(ctx0, score, n_comp, nc*n_stream);
                     if (n_blk*bs != n_comp) {
                         s2 = ggml_concat(ctx0, s2, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blk*bs - n_comp, nc*n_stream), -INFINITY), 0);
+                        on_layer_dev(s2, il);
                     }
                     ggml_tensor * bmax = ggml_pool_1d(ctx0, s2, GGML_OP_POOL_MAX, bs, bs, 0);
+                    on_layer_dev(bmax, il);
                     bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(cand_pin));
                     cb(bmax, "cand_block_score", il);
                     parts_sel.push_back(ggml_top_k(ctx0, bmax, std::min<int64_t>(hparams.dsv41_cand_topk_blocks, n_blk)));

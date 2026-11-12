@@ -3199,7 +3199,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // one CUDA graph per input copy of the scheduler (pipeline parallelism): each copy has its own addresses,
+    // so a single graph would be updated on every call and never get past the warmup (a tensor is far larger
+    // than the offset, so the keys stay distinct)
+    return (const char *) cgraph->nodes[0] + cgraph->copy_id;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

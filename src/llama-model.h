@@ -987,6 +987,7 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    bool has_host_tensor_overrides() const; // an override puts weights in host memory
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

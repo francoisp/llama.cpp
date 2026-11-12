@@ -1378,6 +1378,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool has_host_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1440,6 +1441,15 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+
+    // overrides that keep weights in host memory: GPU ops on them copy the weights into their splits
+    pimpl->has_host_tensor_overrides = false;
+    for (const auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
+        ggml_backend_dev_t dev = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
+        if (!o->buft || ggml_backend_buft_is_host(o->buft) || !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            pimpl->has_host_tensor_overrides = true;
+        }
+    }
 }
 
 llama_model::~llama_model() {
@@ -2934,6 +2944,10 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::has_host_tensor_overrides() const {
+    return pimpl->has_host_tensor_overrides;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
