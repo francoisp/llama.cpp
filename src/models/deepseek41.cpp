@@ -845,14 +845,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 comp_k = ggml_cast(ctx0, ggml_cast(ctx0, comp_k, GGML_TYPE_F32), raw_k->type);
             } else if (comp_k->type != raw_k->type) {
                 comp_k = ggml_cast(ctx0, comp_k, raw_k->type);
-            } else if (!comp_k_view_env || model.no_alloc()) {
+            }
+            // flash attention reads the window rows and the compressed rows in place ([window | compressed] without a
+            // copy of the n_comp rows per layer: 1 GiB at 1M context; env LLAMA_DSV41_KV_PREFIX=0 restores the copy)
+            static const bool kv_prefix_env = dsv41_env_on("LLAMA_DSV41_KV_PREFIX");
+            const bool kv_prefix = kv_prefix_env && cparams.fused_kv_prefix && comp_k->op == GGML_OP_VIEW &&
+                comp_k->type == raw_k->type && comp_k->type == GGML_TYPE_F16 && raw_k->nb[0] == ggml_type_size(raw_k->type);
+            if (!kv_prefix && comp_k->op == GGML_OP_VIEW && (!comp_k_view_env || model.no_alloc())) {
                 comp_k = ggml_cont(ctx0, comp_k);
             }
             // otherwise the concat below reads the strided rows in place: one copy instead of a cont plus a concat
             // (env LLAMA_DSV41_COMP_K_VIEW=0 restores the cont). The --fit measurement (a no_alloc model) still
             // sizes the cont, so the layer split and every result stay as before; the run just needs less memory.
             cb(comp_k, "comp_k", il);
-            ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+            ggml_tensor * k_all = kv_prefix ? nullptr : ggml_concat(ctx0, raw_k, comp_k, 2);
 
             // [window mask | top-k comp mask] in one op, without the full-length top-k mask that the concat reads and
             // writes again per layer: half the mask memory at long context (env LLAMA_DSV41_MASK_PREFIX=0: the concat)
@@ -872,7 +878,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
             // at most window + top-k visible columns per query: lets CUDA FA gather only those
             const int64_t n_kv_max = sparse ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
-            out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+            if (kv_prefix) {
+                out = build_attn_mha(q, comp_k, comp_k, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il, raw_k, raw_k);
+            } else {
+                out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+            }
         }
         if (k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, k_rot);

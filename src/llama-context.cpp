@@ -136,6 +136,13 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// the dense prompt path of DeepSeek V4.1 (more than 32 tokens per sequence) attends over [window | compressed rows]
+static const llm_fused_op_probe llm_fused_op_flash_attn_kv_prefix_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_KV_PREFIX,
+    /*.name             =*/ "Flash Attention with a K/V prefix",
+    /*.n_tokens_per_seq =*/ 64,
+};
+
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
@@ -371,6 +378,10 @@ llama_context::llama_context(
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+
+    // resolved after flash attention, see resolve_fused_ops()
+    cparams.fused_kv_prefix = false;
+    cparams.auto_fkvp       = hparams.indexer_top_k > 0;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -774,6 +785,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
         resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
         cparams.auto_ftkm = false;
+    }
+
+    if (cparams.auto_fkvp) {
+        cparams.fused_kv_prefix = cparams.flash_attn;
+        resolve(llm_fused_op_flash_attn_kv_prefix_probe, cparams.fused_kv_prefix);
+        cparams.auto_fkvp = false;
     }
 }
 

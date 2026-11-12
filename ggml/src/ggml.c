@@ -5702,6 +5702,29 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_add_kv_prefix(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_pre,
+        struct ggml_tensor * v_pre) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && "a K/V prefix does not combine with kv_rows");
+    GGML_ASSERT(a->src[6] == NULL && a->src[7] == NULL);
+    GGML_ASSERT(k_pre != NULL && v_pre != NULL);
+
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    GGML_ASSERT(k_pre->type == k->type && v_pre->type == v->type);
+    GGML_ASSERT(k_pre->ne[0] == k->ne[0] && k_pre->ne[2] == k->ne[2] && k_pre->ne[3] == k->ne[3]);
+    GGML_ASSERT(v_pre->ne[0] == v->ne[0] && v_pre->ne[2] == v->ne[2] && v_pre->ne[3] == v->ne[3]);
+    GGML_ASSERT(v_pre->ne[1] == k_pre->ne[1]);
+    GGML_ASSERT(k_pre->nb[0] == ggml_type_size(k_pre->type) && v_pre->nb[0] == ggml_type_size(v_pre->type));
+    GGML_ASSERT(!a->src[3] || a->src[3]->ne[0] >= k_pre->ne[1] + k->ne[1]);
+
+    a->src[6] = k_pre;
+    a->src[7] = v_pre;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

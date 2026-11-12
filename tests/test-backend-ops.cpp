@@ -9137,6 +9137,79 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with a K/V prefix (ggml_flash_attn_ext_add_kv_prefix): attention over [k_pre | k], k being
+// the first hs values of wider cache rows (the compressed rows of DeepSeek V4.1 carry their index keys after K)
+struct test_flash_attn_ext_kv_prefix : public test_case {
+    const int64_t hs;
+    const int64_t gqa;      // Q heads, one K/V head
+    const int64_t n_pre;
+    const int64_t kv;
+    const int64_t nb;       // queries
+    const int64_t ns;       // streams (ne3)
+    const int64_t n_kv_max; // > 0: sparse mask (CUDA gathers the visible rows)
+    const bool    v_is_k;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, gqa, n_pre, kv, nb, ns, n_kv_max, v_is_k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kv_prefix(int64_t hs = 512, int64_t gqa = 8, int64_t n_pre = 512, int64_t kv = 4096, int64_t nb = 64,
+                                  int64_t ns = 1, int64_t n_kv_max = 512, bool v_is_k = true)
+        : hs(hs), gqa(gqa), n_pre(n_pre), kv(kv), nb(nb), ns(ns), n_kv_max(n_kv_max), v_is_k(v_is_k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, gqa, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k_store = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs + 128, kv, 1, ns);
+        ggml_set_name(k_store, "k_store");
+        ggml_tensor * k = ggml_view_4d(ctx, k_store, hs, kv, 1, ns, k_store->nb[1], k_store->nb[2], k_store->nb[3], 0);
+        ggml_tensor * k_pre = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, n_pre, 1, ns);
+        ggml_set_name(k_pre, "k_pre");
+
+        ggml_tensor * v;
+        ggml_tensor * v_pre;
+        if (v_is_k) {
+            v     = ggml_view_4d(ctx, k_store, hs, kv, 1, ns, k_store->nb[1], k_store->nb[2], k_store->nb[3], 0);
+            v_pre = ggml_view_4d(ctx, k_pre, hs, n_pre, 1, ns, k_pre->nb[1], k_pre->nb[2], k_pre->nb[3], 0);
+        } else {
+            v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv,    1, ns);
+            v_pre = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, n_pre, 1, ns);
+            ggml_set_name(v, "v");
+            ggml_set_name(v_pre, "v_pre");
+        }
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_pre + kv, nb, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_kv_prefix(out, k_pre, v_pre);
+        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                if (n_kv_max > 0) {
+                    init_tensor_kq_mask_sparse(t, n_kv_max);
+                } else {
+                    init_tensor_kq_mask(t);
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -13186,6 +13259,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
         }
     }
+
+    // flash attention over [K/V prefix | K/V] read in place (DeepSeek V4.1: window rows, then compressed rows)
+    for (int64_t nb : {1, 8, 64}) {
+        for (bool v_is_k : {true, false}) {
+            test_cases.emplace_back(new test_flash_attn_ext_kv_prefix(512,  8, 512, 4096, nb, 1, 512, v_is_k)); // sparse
+            test_cases.emplace_back(new test_flash_attn_ext_kv_prefix(512,  8, 512, 4096, nb, 1,   0, v_is_k)); // dense
+            test_cases.emplace_back(new test_flash_attn_ext_kv_prefix(512, 16, 256, 1024, nb, 2,   0, v_is_k)); // 2 streams
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_kv_prefix(512, 64, 512, 8192, 256, 1, 640, true)); // V4.1 prompt ubatch
+    test_cases.emplace_back(new test_flash_attn_ext_kv_prefix(512, 64, 512, 8192,  64, 2, 640, true));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_prefix(128,  4, 100,  400,   3, 1,   0, false)); // unpadded
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));

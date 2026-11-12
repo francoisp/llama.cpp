@@ -49,6 +49,8 @@ struct llama_cparams {
     bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
+    bool fused_kv_prefix;    // flash attention reads K/V rows ahead of K/V in place (ggml_flash_attn_ext_add_kv_prefix)
+    bool auto_fkvp;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

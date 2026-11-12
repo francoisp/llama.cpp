@@ -3076,8 +3076,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * k_pre,
+         ggml_tensor * v_pre) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+    GGML_ASSERT((k_pre == nullptr) == (v_pre == nullptr));
+    GGML_ASSERT(!k_pre || (!kv_rows && !v_trans));
 
     // split the batch into streams if needed
     const auto n_stream = kv_rows ? kv_rows->ne[1] : k->ne[3];
@@ -3090,10 +3094,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (k_pre) {
+        k_pre = ggml_permute(ctx0, k_pre, 0, 2, 1, 3);
+        v_pre = ggml_permute(ctx0, v_pre, 0, 2, 1, 3);
+    }
 
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    if (k_pre && !use_flash_attn) {
+        // without flash attention: the concatenated rows
+        k = ggml_concat(ctx0, k_pre, k, 1);
+        v = ggml_concat(ctx0, v_pre, v, 1);
+        k_pre = v_pre = nullptr;
+    }
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
@@ -3118,7 +3132,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         }
-        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        if (k_pre) {
+            ggml_flash_attn_ext_add_kv_prefix(cur, k_pre, v_pre);
+        }
+        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : k_pre ? LLM_FUSED_OP_FLASH_ATTN_KV_PREFIX : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);

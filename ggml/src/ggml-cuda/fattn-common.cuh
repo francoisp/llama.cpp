@@ -18,6 +18,16 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// K/V rows ahead of the K/V rows (ggml_flash_attn_ext_add_kv_prefix): column i < n of the mask uses row i of these,
+// column n + j row j of K/V. Only the sparse gather of the mma kernel reads them, the other paths get one copy.
+struct fattn_kv_prefix {
+    const char * K;
+    const char * V;
+    int32_t n;
+    int32_t nb11; int32_t nb12; int64_t nb13;
+    int32_t nb21; int32_t nb22; int64_t nb23;
+};
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -26,6 +36,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
         const int  * __restrict__ KV_rows,
+        const fattn_kv_prefix kv_pre,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -1070,6 +1081,8 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    // the pool frees in reverse order of allocation: the [prefix | K/V] copy is allocated first, so declared first
+    ggml_cuda_pool_alloc<char>   KV_cat(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1145,6 +1158,70 @@ void launch_fattn(
                 nb23 = V->ne[2] * nb22;
             }
             V_data = (char *) V_f16;
+        }
+    }
+
+    // K/V rows ahead of K/V (ggml_flash_attn_ext_add_kv_prefix; K and V here count them, see ggml_cuda_flash_attn_ext):
+    // the sparse gather reads them in place, the other kernels attend over one copy of [prefix | K/V], which is made
+    // only below the sparse threshold (a few thousand rows)
+    const ggml_tensor * K_pre = dst->src[6];
+    const ggml_tensor * V_pre = dst->src[7];
+    fattn_kv_prefix kv_pre = {};
+    if (K_pre) {
+        GGML_ASSERT(!kv_rows && V_pre);
+        GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && K_pre->type == GGML_TYPE_F16 && V_pre->type == GGML_TYPE_F16);
+        const int64_t n_pre  = K_pre->ne[1];
+        const int64_t n_main = K->ne[1] - n_pre;
+        GGML_ASSERT(n_main >= 0 && V_pre->ne[1] == n_pre);
+        if (use_sparse) {
+            kv_pre.K    = (const char *) K_pre->data;
+            kv_pre.V    = (const char *) V_pre->data;
+            kv_pre.n    = n_pre;
+            kv_pre.nb11 = K_pre->nb[1];
+            kv_pre.nb12 = K_pre->nb[2];
+            kv_pre.nb13 = K_pre->nb[3];
+            kv_pre.nb21 = V_pre->nb[1];
+            kv_pre.nb22 = V_pre->nb[2];
+            kv_pre.nb23 = V_pre->nb[3];
+        } else {
+            const size_t  row_k  = K->ne[0]*sizeof(half);
+            const size_t  row_v  = V->ne[0]*sizeof(half);
+            const int64_t n_rows = K->ne[1];
+            const size_t  size_k = row_k*n_rows*K->ne[2]*K->ne[3];
+            const size_t  size_v = V_is_K_view ? 0 : row_v*n_rows*V->ne[2]*V->ne[3];
+            char * cat = KV_cat.alloc(size_k + size_v);
+            const auto copy = [&](char * out, size_t row, const ggml_tensor * pre, const char * src, size_t s1, size_t s2, size_t s3, int64_t ne2, int64_t ne3) {
+                for (int64_t i3 = 0; i3 < ne3; ++i3) {
+                    for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                        char * o = out + (i3*ne2 + i2)*n_rows*row;
+                        if (n_pre > 0) {
+                            CUDA_CHECK(cudaMemcpy2DAsync(o, row, (const char *) pre->data + i2*pre->nb[2] + i3*pre->nb[3], pre->nb[1],
+                                row, n_pre, cudaMemcpyDeviceToDevice, main_stream));
+                        }
+                        if (n_main > 0) {
+                            CUDA_CHECK(cudaMemcpy2DAsync(o + n_pre*row, row, src + i2*s2 + i3*s3, s1,
+                                row, n_main, cudaMemcpyDeviceToDevice, main_stream));
+                        }
+                    }
+                }
+            };
+            copy(cat, row_k, K_pre, K_data, nb11, nb12, nb13, K->ne[2], K->ne[3]);
+            K_data = cat;
+            nb11   = row_k;
+            nb12   = n_rows*nb11;
+            nb13   = K->ne[2]*nb12;
+            if (V_is_K_view) {
+                V_data = K_data;
+                nb21   = nb11;
+                nb22   = nb12;
+                nb23   = nb13;
+            } else {
+                copy(cat + size_k, row_v, V_pre, V_data, nb21, nb22, nb23, V->ne[2], V->ne[3]);
+                V_data = cat + size_k;
+                nb21   = row_v;
+                nb22   = n_rows*nb21;
+                nb23   = V->ne[2]*nb22;
+            }
         }
     }
 
@@ -1318,6 +1395,7 @@ void launch_fattn(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         kv_rows ? (const int *) kv_rows->data : nullptr,
+        kv_pre,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

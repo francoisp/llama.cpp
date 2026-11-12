@@ -816,8 +816,37 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// a K/V prefix (ggml_flash_attn_ext_add_kv_prefix): the kernel selection and the kernels see K/V of n_pre + n_kv rows,
+// as they would the concatenated rows, launch_fattn takes the first n_pre rows from src[6]/src[7]. Only the tensor
+// structs are extended, not the data.
+struct ggml_cuda_fattn_kv_prefix_view {
+    ggml_tensor K, V, dst;
+
+    explicit ggml_cuda_fattn_kv_prefix_view(const ggml_tensor * op) : K(*op->src[1]), V(*op->src[2]), dst(*op) {
+        K.ne[1] += op->src[6]->ne[1];
+        V.ne[1] += op->src[7]->ne[1];
+        dst.src[1] = &K;
+        dst.src[2] = &V;
+    }
+};
+
+static bool ggml_cuda_fattn_kv_prefix_supported(const ggml_tensor * dst) {
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * K_pre = dst->src[6];
+    const ggml_tensor * V_pre = dst->src[7];
+    return dst->src[5] == nullptr && V_pre != nullptr &&
+        K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && K_pre->type == GGML_TYPE_F16 && V_pre->type == GGML_TYPE_F16;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    std::unique_ptr<ggml_cuda_fattn_kv_prefix_view> pre;
+    if (dst->src[6]) {
+        GGML_ASSERT(ggml_cuda_fattn_kv_prefix_supported(dst));
+        pre = std::make_unique<ggml_cuda_fattn_kv_prefix_view>(dst);
+        dst = &pre->dst;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -834,5 +863,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[6]) {
+        if (!ggml_cuda_fattn_kv_prefix_supported(dst)) {
+            return false;
+        }
+        const ggml_cuda_fattn_kv_prefix_view pre(dst);
+        return ggml_cuda_get_best_fattn_kernel(device, &pre.dst) != BEST_FATTN_KERNEL_NONE;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

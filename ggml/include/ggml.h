@@ -2556,6 +2556,15 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // K/V rows ahead of the rows of k and v: attention over [k_pre | k] and [v_pre | v] without concatenating them.
+    // Mask column i < n_pre uses row i of k_pre/v_pre, column n_pre + j row j of k/v; the mask has n_pre + n_kv columns.
+    // k_pre: [n_embd_k, n_pre, n_head_kv, ne3], v_pre: [n_embd_v, n_pre, n_head_kv, ne3], of the types of k and v.
+    // Not with ggml_flash_attn_ext_rows.
+    GGML_API void ggml_flash_attn_ext_add_kv_prefix(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_pre,
+            struct ggml_tensor * v_pre);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
