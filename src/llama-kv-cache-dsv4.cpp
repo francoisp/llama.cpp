@@ -658,7 +658,21 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     // Keep the mask (and with it the compressed-attention branch) present even
     // before the first block is visible, so the graph topology never changes.
     // Padded slots are masked out; comp cache buffers are zero-initialized.
-    plan.n_kv = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
+    const int64_t n_kv_min = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
+
+    // Prompt ubatches grow the compressed length by n_tokens/ratio each, so with 256-row padding every one or
+    // two of them gets new tensor shapes and a new graph (a scheduler split and allocation, 30-60 ms with V4.1
+    // on 8 GPUs). Coarser padding lets consecutive prompt ubatches reuse the graph. Decode and draft
+    // verification keep the 256 rows. The lengths stay multiples of 256, and the last 256 cache slots stay out of
+    // reach of the padding (the last one may take a dummy write). LLAMA_DSV4_PREFILL_PAD sets the step (256 = off).
+    static const int64_t prefill_pad = [] {
+        const char * env = getenv("LLAMA_DSV4_PREFILL_PAD");
+        return env ? (int64_t) GGML_PAD(std::max<int64_t>(256, atoll(env)), 256) : int64_t(2048);
+    }();
+    plan.n_kv = n_kv_min;
+    if (ubatch.n_tokens >= 64 && prefill_pad > 256) {
+        plan.n_kv = std::max<int64_t>(n_kv_min, std::min<int64_t>(GGML_PAD(n_kv_min, prefill_pad), (int64_t) kv_size - 256));
+    }
 
     std::sort(persist_rows.begin(), persist_rows.end(),
             [](const persist_row & a, const persist_row & b) {
