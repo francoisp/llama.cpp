@@ -1469,6 +1469,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+        // dense path with the rows chosen per query (kv_sel): the top-k picks as kv_sel and the window + top-k mask,
+        // per (top-k source, compressed rows)
+        std::map<std::pair<int32_t, const void *>, std::pair<ggml_tensor *, ggml_tensor *>> kv_sel_of;
 
         // compressed masks built on the device of their layers from the visible counts, once per device,
         // instead of a full-length host mask uploaded to every device (env LLAMA_DSV41_DEV_MASK=0 keeps the host mask)

@@ -2565,6 +2565,15 @@ extern "C" {
             struct ggml_tensor * k_pre,
             struct ggml_tensor * v_pre);
 
+    // K/V rows chosen per query: mask column n_pre + j of query i1 (n_pre: the rows of a K/V prefix, else 0) uses row
+    // kv_sel[j, i1, 0, i3 % ne3] of k/v, instead of row j; the mask has n_pre + n_sel columns and the values of kv_sel
+    // under -inf mask cells are not read; the rows can come in any order. Attention over a few chosen rows of a long cache
+    // without a mask of its length.
+    // kv_sel: I32 [n_sel, n_q, 1, ne3 of the mask], n_q >= the queries per sequence. Not with ggml_flash_attn_ext_rows.
+    GGML_API void ggml_flash_attn_ext_add_kv_sel(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_sel);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2849,6 +2858,19 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // ggml_top_k_mask_prefix_count with a column per pick instead of per key: the mask for attention over the picked rows
+    // (ggml_flash_attn_ext_add_kv_sel with kv_sel = top_k)
+    //
+    // res: [n_pre + n_top, ne1, ne2, ne3] of the type of prefix
+    //
+    // res[n_pre + j, i] = 0 when 0 <= top_k[j, i] < n_visible[i], else -inf
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask_prefix_count_sel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prefix,
+            struct ggml_tensor  * n_visible,
+            struct ggml_tensor  * top_k);
 
     // prefix attention mask: the first n_visible[i] cells of row i are visible
     //

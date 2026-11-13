@@ -875,33 +875,58 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // (env LLAMA_DSV41_COMP_K_VIEW=0 restores the cont). The --fit measurement (a no_alloc model) still
             // sizes the cont, so the layer split and every result stay as before; the run just needs less memory.
             cb(comp_k, "comp_k", il);
-            ggml_tensor * k_all = kv_prefix ? nullptr : ggml_concat(ctx0, raw_k, comp_k, 2);
-
-            // [window mask | top-k comp mask] in one op, without the full-length top-k mask that the concat reads and
-            // writes again per layer: half the mask memory at long context (env LLAMA_DSV41_MASK_PREFIX=0: the concat)
-            static const bool mask_prefix_env = dsv41_env_on("LLAMA_DSV41_MASK_PREFIX");
-            ggml_tensor * kq_mask = nullptr;
-            const ggml_tensor * cm = ci.kq_mask; // the shape of the compressed mask
-            if (mask_prefix_env && cparams.fused_top_k_mask && raw_mask->type == cm->type &&
-                    raw_mask->nb[0] == ggml_type_size(raw_mask->type) &&
-                    raw_mask->ne[1] == cm->ne[1] && raw_mask->ne[2] == cm->ne[2] && raw_mask->ne[3] == cm->ne[3]) {
-                ggml_tensor * top_k_m = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], cm->ne[1], cm->ne[2], cm->ne[3]);
-                kq_mask = comp_vis ?
-                    ggml_top_k_mask_prefix_count(ctx0, raw_mask, comp_vis, n_comp, top_k_m, nullptr, nullptr, nullptr) :
-                    ggml_top_k_mask_prefix(ctx0, raw_mask, comp_mask(), top_k_m, nullptr, nullptr, nullptr);
-                res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, kq_mask, il});
-            } else {
-                ggml_tensor * sel_mask = build_top_k_mask(comp_mask(), top_k, "comp_top_k_mask", il);
-                kq_mask = ggml_concat(ctx0, raw_mask, sel_mask, 0);
-            }
-            cb(kq_mask, "comp_kq_mask", il);
 
             // at most window + top-k visible columns per query: lets CUDA FA gather only those
             const int64_t n_kv_max = sparse ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
-            if (kv_prefix) {
-                out = build_attn_mha(q, comp_k, comp_k, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il, raw_k, raw_k);
+            const ggml_tensor * cm = ci.kq_mask; // the shape of the compressed mask
+
+            // flash attention reads the top-k rows of each query through the picks, with a mask of window + top-k
+            // columns: no mask over all compressed rows (512 MiB per GPU at 1M context and 256-token ubatches), written
+            // and scanned again in every compressed layer. CUDA sums the rows in the order of the full mask and
+            // expands it below the length where it gathers the rows: same result (env LLAMA_DSV41_KV_SEL=0: the full mask)
+            static const bool kv_sel_env = dsv41_env_on("LLAMA_DSV41_KV_SEL");
+            const bool kv_sel = kv_sel_env && sparse && kv_prefix && comp_vis && cparams.fused_kv_sel && cparams.fused_top_k_mask &&
+                raw_mask->type == GGML_TYPE_F16 && raw_mask->ne[0] == n_raw && (n_raw + k_sel) % 8 == 0 &&
+                raw_mask->nb[0] == ggml_type_size(raw_mask->type) &&
+                raw_mask->ne[1] == cm->ne[1] && raw_mask->ne[2] == cm->ne[2] && raw_mask->ne[3] == cm->ne[3] &&
+                ggml_is_contiguous(top_k);
+            if (kv_sel) {
+                auto & sel_mask = kv_sel_of[{topk_src, ci.n_visible}];
+                if (!sel_mask.first) {
+                    ggml_tensor * sel = ggml_reshape_4d(ctx0, top_k, k_sel, cm->ne[1], cm->ne[2], cm->ne[3]);
+                    ggml_tensor * sel_kq_mask = ggml_top_k_mask_prefix_count_sel(ctx0, raw_mask, comp_vis, sel);
+                    res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, sel_kq_mask, il});
+                    cb(sel_kq_mask, "comp_kq_mask_sel", il);
+                    sel_mask = {sel, sel_kq_mask};
+                }
+                out = build_attn_mha(q, comp_k, comp_k, nullptr, sel_mask.second, nullptr, layer.attn_sinks, nullptr, n_kv_max,
+                        kq_scale, il, raw_k, raw_k, sel_mask.first);
             } else {
-                out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+                ggml_tensor * k_all = kv_prefix ? nullptr : ggml_concat(ctx0, raw_k, comp_k, 2);
+
+                // [window mask | top-k comp mask] in one op, without the full-length top-k mask that the concat reads and
+                // writes again per layer: half the mask memory at long context (env LLAMA_DSV41_MASK_PREFIX=0: the concat)
+                static const bool mask_prefix_env = dsv41_env_on("LLAMA_DSV41_MASK_PREFIX");
+                ggml_tensor * kq_mask = nullptr;
+                if (mask_prefix_env && cparams.fused_top_k_mask && raw_mask->type == cm->type &&
+                        raw_mask->nb[0] == ggml_type_size(raw_mask->type) &&
+                        raw_mask->ne[1] == cm->ne[1] && raw_mask->ne[2] == cm->ne[2] && raw_mask->ne[3] == cm->ne[3]) {
+                    ggml_tensor * top_k_m = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], cm->ne[1], cm->ne[2], cm->ne[3]);
+                    kq_mask = comp_vis ?
+                        ggml_top_k_mask_prefix_count(ctx0, raw_mask, comp_vis, n_comp, top_k_m, nullptr, nullptr, nullptr) :
+                        ggml_top_k_mask_prefix(ctx0, raw_mask, comp_mask(), top_k_m, nullptr, nullptr, nullptr);
+                    res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, kq_mask, il});
+                } else {
+                    ggml_tensor * sel_mask = build_top_k_mask(comp_mask(), top_k, "comp_top_k_mask", il);
+                    kq_mask = ggml_concat(ctx0, raw_mask, sel_mask, 0);
+                }
+                cb(kq_mask, "comp_kq_mask", il);
+
+                if (kv_prefix) {
+                    out = build_attn_mha(q, comp_k, comp_k, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il, raw_k, raw_k);
+                } else {
+                    out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+                }
             }
         }
         if (k_rot) {

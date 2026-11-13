@@ -8830,6 +8830,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * k_pre = dst->src[6];
     const ggml_tensor * v_pre = dst->src[7];
     const int64_t n_pre = k_pre ? k_pre->ne[1] : 0;
+    // K/V rows chosen per query (ggml_flash_attn_ext_add_kv_sel): column n_pre + j uses row kv_sel[j, iq1] of k/v
+    const ggml_tensor * kv_sel = dst->src[8];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8933,6 +8935,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         q_to_vec_dot(pq, Q_q, DK);
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
+        const int32_t * sel  = kv_sel  ? (const int32_t *) ((const char *) kv_sel->data + iq1*kv_sel->nb[1] + (iq3 % kv_sel->ne[3])*kv_sel->nb[3]) : nullptr;
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -8944,7 +8947,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 continue;
             }
 
-            const int64_t ik1 = rows ? rows[ic] : ic;
+            const int64_t ik1 = rows ? rows[ic] : sel && ic >= n_pre ? n_pre + sel[ic - n_pre] : ic;
             if (ik1 < 0) {
                 continue;
             }
@@ -9467,12 +9470,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     // with kv_rows the loops run over the mask columns, the split KV path does not support it (nor a K/V prefix)
+    // (nor rows chosen per query, which the tiled path does not support either)
     const ggml_tensor * kv_rows = dst->src[5];
     const ggml_tensor * k_pre   = dst->src[6];
-    const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : (k_pre ? k_pre->ne[1] : 0) + nek1;
+    const ggml_tensor * kv_sel  = dst->src[8];
+    const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : (k_pre ? k_pre->ne[1] : 0) + (kv_sel ? kv_sel->ne[0] : nek1);
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && !kv_rows && !k_pre && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && !kv_rows && !k_pre && !kv_sel && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9529,7 +9534,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !kv_sel &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -11689,6 +11694,9 @@ void ggml_compute_forward_top_k_mask(
     const bool m_count = mask->type == GGML_TYPE_I32;
     GGML_ASSERT(m_count || dst->type == mask->type);
     GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
+    // a column per pick (ggml_top_k_mask_prefix_count_sel)
+    const bool sel = ggml_get_op_params_i32(dst, 0) != 0;
+    GGML_ASSERT(!sel || (m_count && !score && !blocks && !extra));
 
     const int64_t n_pre   = prefix ? prefix->ne[0] : 0;
     const int64_t n_kv    = m_count ? dst->ne[0] - n_pre : mask->ne[0];
@@ -11721,6 +11729,20 @@ void ggml_compute_forward_top_k_mask(
                 + (i1 % prefix->ne[1])*prefix->nb[1] + (i2 % prefix->ne[2])*prefix->nb[2] + (i3 % prefix->ne[3])*prefix->nb[3];
             memcpy(dst_row, prefix_row, n_pre*ts);
             dst_row += n_pre*ts;
+        }
+
+        if (sel) {
+            const char * top_k_row = (const char *) top_k->data + i1*top_k->nb[1] + i2*top_k->nb[2] + i3*top_k->nb[3];
+            for (int64_t j = 0; j < n_top; ++j) {
+                const int32_t p = *(const int32_t *) (top_k_row + j*top_k->nb[0]);
+                const float   v = p >= 0 && p < n_vis ? 0.0f : -INFINITY;
+                if (dst->type == GGML_TYPE_F16) {
+                    ((ggml_fp16_t *) dst_row)[j] = GGML_CPU_FP32_TO_FP16(v);
+                } else {
+                    ((float *) dst_row)[j] = v;
+                }
+            }
+            continue;
         }
 
         if (dst->type == GGML_TYPE_F16) {

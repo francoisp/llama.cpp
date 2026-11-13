@@ -3078,10 +3078,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * k_pre,
-         ggml_tensor * v_pre) const {
+         ggml_tensor * v_pre,
+         ggml_tensor * kv_sel) const {
     const bool v_trans = v->nb[1] > v->nb[2];
     GGML_ASSERT((k_pre == nullptr) == (v_pre == nullptr));
     GGML_ASSERT(!k_pre || (!kv_rows && !v_trans));
+    GGML_ASSERT(!kv_sel || (cparams.flash_attn && kq_b == nullptr && !kv_rows && !v_trans));
 
     // split the batch into streams if needed
     const auto n_stream = kv_rows ? kv_rows->ne[1] : k->ne[3];
@@ -3132,10 +3134,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         }
+        if (kv_sel) {
+            ggml_flash_attn_ext_add_kv_sel(cur, kv_sel);
+        }
         if (k_pre) {
             ggml_flash_attn_ext_add_kv_prefix(cur, k_pre, v_pre);
         }
-        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : k_pre ? LLM_FUSED_OP_FLASH_ATTN_KV_PREFIX : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : kv_sel ? LLM_FUSED_OP_FLASH_ATTN_KV_SEL :
+            k_pre ? LLM_FUSED_OP_FLASH_ATTN_KV_PREFIX : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);

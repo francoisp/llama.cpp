@@ -18,7 +18,7 @@ static __global__ void top_k_mask_kernel(
         const int64_t ss0, const int64_t ss1, const int64_t ss2, const int64_t ss3,
         const int64_t sb0, const int64_t sb1,
         const int64_t se0, const int64_t se1, const int64_t se2, const int64_t se3,
-        const bool vec, const bool vec_pre) {
+        const bool vec, const bool vec_pre, const bool sel) {
     ggml_cuda_pdl_lc();
 
     const int64_t ir = blockIdx.x;
@@ -53,6 +53,16 @@ static __global__ void top_k_mask_kernel(
 
     const T ninf = ggml_cuda_cast<T>(-INFINITY);
     const T zero = ggml_cuda_cast<T>(0.0f);
+
+    // a column per pick (ggml_top_k_mask_prefix_count_sel)
+    if (sel) {
+        for (int64_t j = threadIdx.x; j < n_top; j += blockDim.x) {
+            const int32_t p = top_k_row[j*sk0];
+            dst_row[j] = p >= 0 && p < n_vis ? zero : ninf;
+        }
+        return;
+    }
+
     const auto cell = [&](const int64_t c) { return count ? (c < n_vis ? zero : ninf) : mask_row[c]; };
     if (vec) {
         constexpr int nv = sizeof(int4)/sizeof(T);
@@ -116,6 +126,8 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     // an I32 mask is the number of visible keys of each row [m1, m2, m3] (ggml_top_k_mask_prefix_count)
     const bool    m_count = mask->type == GGML_TYPE_I32;
+    const bool    sel     = ggml_get_op_params_i32(dst, 0) != 0; // a column per pick
+    GGML_ASSERT(!sel || (m_count && !score && !blocks && !extra));
     const int64_t n_pre   = prefix ? prefix->ne[0] : 0;
     const int64_t n_kv    = m_count ? dst->ne[0] - n_pre : mask->ne[0];
     const size_t  sm      = m_count ? sizeof(int32_t) : sizeof(T);
@@ -161,7 +173,7 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             score  ? score->nb[0]/sf  : 0, score ? score->nb[1]/sf : 0, score ? score->nb[2]/sf : 0, score ? score->nb[3]/sf : 0,
             blocks ? blocks->nb[0]/si : 0, blocks ? blocks->nb[1]/si : 0,
             extra  ? extra->nb[0]/si  : 0, extra ? extra->nb[1]/si : 0, extra ? extra->nb[2]/si : 0, extra ? extra->nb[3]/si : 0,
-            vec, vec_pre);
+            vec, vec_pre, sel);
 }
 
 void ggml_cuda_op_top_k_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

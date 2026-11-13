@@ -420,6 +420,7 @@ struct fattn_kv_pre_h2 {
     int n;
     int stride_K;
     int stride_V;
+    int64_t rows_off; // kv_sel: the K/V rows of the listed columns follow the index list at this offset (0: it lists rows)
 };
 
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
@@ -690,7 +691,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (V_h2, tile_V, min(nbatch_V2, DV/2), stride_V, k_VKQ_0, k_VKQ_sup, indices);
+            (V_h2, tile_V, min(nbatch_V2, DV/2), stride_V, k_VKQ_0, k_VKQ_sup, indices + pre.rows_off);
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
@@ -710,7 +711,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices,
+                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices + pre.rows_off,
                  pre.n > 0 ? pre.K + k0_start : nullptr, pre.stride_K, pre.n);
             if (use_cp_async) {
                 cp_async_wait_all();
@@ -1048,7 +1049,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, indices);
+                (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, indices + pre.rows_off);
         }
     }
 
@@ -1064,7 +1065,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices,
+                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices + pre.rows_off,
                      pre.n > 0 ? pre.V + i0_start/2 : nullptr, pre.stride_V, pre.n);
                 if (use_cp_async) {
                     cp_async_wait_all();
@@ -1469,7 +1470,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
+            (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices + pre.rows_off);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -1923,10 +1924,10 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
 }
 
-// the K/V prefix rows of the K/V head z_KV of a sequence, for the sparse gather
+// the K/V prefix rows of the K/V head z_KV of a sequence and where the K/V rows of the index list are, for the sparse gather
 template <bool use_sparse, bool V_is_K_view>
 static __device__ __forceinline__ fattn_kv_pre_h2 fattn_kv_pre_tile(const fattn_kv_prefix & p, const int sequence, const int z_KV) {
-    fattn_kv_pre_h2 r = {nullptr, nullptr, 0, 0, 0};
+    fattn_kv_pre_h2 r = {nullptr, nullptr, 0, 0, 0, 0};
     if constexpr (use_sparse) {
         if (p.n > 0) {
             r.K        = (const half2 *) (p.K + p.nb13*sequence + int64_t(p.nb12)*z_KV);
@@ -1935,6 +1936,7 @@ static __device__ __forceinline__ fattn_kv_pre_h2 fattn_kv_pre_tile(const fattn_
             r.stride_K = p.nb11 / sizeof(half2);
             r.stride_V = V_is_K_view ? r.stride_K : p.nb21 / sizeof(half2);
         }
+        r.rows_off = p.rows_off;
     }
     GGML_UNUSED_VARS(p, sequence, z_KV);
     return r;

@@ -12177,7 +12177,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
             // K/V row lists (ggml_flash_attn_ext_rows) and K/V prefixes (ggml_flash_attn_ext_add_kv_prefix) are not supported
-            if (op->src[5] != nullptr || op->src[6] != nullptr) {
+            if (op->src[5] != nullptr || op->src[6] != nullptr || op->src[8] != nullptr) {
                 return false;
             }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS

@@ -1522,7 +1522,7 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         }
 
         // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-        if (op->src[5] != nullptr || op->src[6] != nullptr) {
+        if (op->src[5] != nullptr || op->src[6] != nullptr || op->src[8] != nullptr) {
             return {false, "FLASH_ATTN_EXT with K/V row lists or a K/V prefix is not supported"};
         }
 

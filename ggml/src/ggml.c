@@ -5719,10 +5719,30 @@ void ggml_flash_attn_ext_add_kv_prefix(
     GGML_ASSERT(v_pre->ne[0] == v->ne[0] && v_pre->ne[2] == v->ne[2] && v_pre->ne[3] == v->ne[3]);
     GGML_ASSERT(v_pre->ne[1] == k_pre->ne[1]);
     GGML_ASSERT(k_pre->nb[0] == ggml_type_size(k_pre->type) && v_pre->nb[0] == ggml_type_size(v_pre->type));
-    GGML_ASSERT(!a->src[3] || a->src[3]->ne[0] >= k_pre->ne[1] + k->ne[1]);
+    // with kv_sel the mask has a column per chosen row
+    GGML_ASSERT(!a->src[3] || a->src[3]->ne[0] >= k_pre->ne[1] + (a->src[8] ? a->src[8]->ne[0] : k->ne[1]));
 
     a->src[6] = k_pre;
     a->src[7] = v_pre;
+}
+
+void ggml_flash_attn_ext_add_kv_sel(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kv_sel) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && "kv_sel does not combine with kv_rows");
+    GGML_ASSERT(a->src[8] == NULL);
+
+    const struct ggml_tensor * q    = a->src[0];
+    const struct ggml_tensor * mask = a->src[3];
+    const int64_t n_pre = a->src[6] ? a->src[6]->ne[1] : 0;
+
+    GGML_ASSERT(mask && "kv_sel needs a mask");
+    GGML_ASSERT(kv_sel->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_sel));
+    GGML_ASSERT(kv_sel->ne[1] >= q->ne[1] && kv_sel->ne[2] == 1 && kv_sel->ne[3] == mask->ne[3]);
+    GGML_ASSERT(mask->ne[0] >= n_pre + kv_sel->ne[0]);
+
+    a->src[8] = kv_sel;
 }
 
 // ggml_flash_attn_back
@@ -6822,8 +6842,10 @@ static struct ggml_tensor * ggml_top_k_mask_impl(
         struct ggml_tensor  * top_k,
         struct ggml_tensor  * score,
         struct ggml_tensor  * blocks,
-        struct ggml_tensor  * extra) {
+        struct ggml_tensor  * extra,
+        bool                  sel) {      // a column per pick (ggml_top_k_mask_prefix_count_sel)
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(!sel || (n_kv_count > 0 && !score && !blocks && !extra));
     if (n_kv_count > 0) {
         GGML_ASSERT(prefix && (prefix->type == GGML_TYPE_F16 || prefix->type == GGML_TYPE_F32));
         GGML_ASSERT(mask->type == GGML_TYPE_I32 && mask->nb[0] == sizeof(int32_t) && mask->ne[3] == 1);
@@ -6859,8 +6881,10 @@ static struct ggml_tensor * ggml_top_k_mask_impl(
     }
 
     const enum ggml_type type = n_kv_count > 0 ? prefix->type : mask->type;
-    const int64_t        n_kv = n_kv_count > 0 ? n_kv_count : mask->ne[0];
+    const int64_t        n_kv = sel ? top_k->ne[0] : n_kv_count > 0 ? n_kv_count : mask->ne[0];
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_pre + n_kv, top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, sel ? 1 : 0);
 
     result->op     = GGML_OP_TOP_K_MASK;
     result->src[0] = mask;
@@ -6880,7 +6904,7 @@ struct ggml_tensor * ggml_top_k_mask(
         struct ggml_tensor  * score,
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra) {
-    return ggml_top_k_mask_impl(ctx, NULL, mask, 0, top_k, score, blocks, extra);
+    return ggml_top_k_mask_impl(ctx, NULL, mask, 0, top_k, score, blocks, extra, false);
 }
 
 struct ggml_tensor * ggml_top_k_mask_prefix(
@@ -6892,7 +6916,7 @@ struct ggml_tensor * ggml_top_k_mask_prefix(
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra) {
     GGML_ASSERT(prefix);
-    return ggml_top_k_mask_impl(ctx, prefix, mask, 0, top_k, score, blocks, extra);
+    return ggml_top_k_mask_impl(ctx, prefix, mask, 0, top_k, score, blocks, extra, false);
 }
 
 struct ggml_tensor * ggml_top_k_mask_prefix_count(
@@ -6905,7 +6929,16 @@ struct ggml_tensor * ggml_top_k_mask_prefix_count(
         struct ggml_tensor  * blocks,
         struct ggml_tensor  * extra) {
     GGML_ASSERT(prefix && n_kv > 0);
-    return ggml_top_k_mask_impl(ctx, prefix, n_visible, n_kv, top_k, score, blocks, extra);
+    return ggml_top_k_mask_impl(ctx, prefix, n_visible, n_kv, top_k, score, blocks, extra, false);
+}
+
+struct ggml_tensor * ggml_top_k_mask_prefix_count_sel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prefix,
+        struct ggml_tensor  * n_visible,
+        struct ggml_tensor  * top_k) {
+    GGML_ASSERT(prefix);
+    return ggml_top_k_mask_impl(ctx, prefix, n_visible, 1, top_k, NULL, NULL, NULL, true);
 }
 
 // ggml_prefix_mask

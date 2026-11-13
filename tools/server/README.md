@@ -438,16 +438,20 @@ environment variable), and logs the ones it applied:
 | `--spec-draft-n-max 4` | with DSpark: 8% faster decode than 3 at 131K (93% of the drafts accepted), the same at 16K; 5 is slower |
 | `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
 
-`-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` does not fit at 512K. Expected speeds with these settings:
+`-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` is no faster at 512K (and fits only with
+`LLAMA_PIPELINE_PARALLEL=1`). Expected speeds with these settings:
 prefill 700-1000 t/s up to 131K (a 524K prompt in about 15 minutes), decode with drafts about 92 t/s at 131K and
 71 t/s at 524K.
 
 The whole 1M context of the model fits too (`-c 1048576`, same command otherwise), with `-ub 256`, every weight on the
-8 GPUs, the draft model and pipeline parallelism. A 950K prompt takes 26 minutes (612 t/s), decode with drafts stays
-at about 71 t/s at 950K. At that length `--fit` sizes the layout to the smaller prompt graph, in which the indexer and
+8 GPUs, the draft model and pipeline parallelism. A 950K prompt takes 26 minutes (621 t/s), decode with drafts stays
+at about 72 t/s at 950K. At that length `--fit` sizes the layout to the smaller prompt graph, in which the indexer and
 the sparse attention mask read the count of visible compressed rows of each token instead of a 512 MiB mask
 (`LLAMA_DSV41_MASK_COUNT=0` turns this off); up to 512K it keeps the layout of the larger graph, which spreads the
-layers for faster prefill, and the run just has more free memory.
+layers for faster prefill, and the run just has more free memory. At any length, flash attention reads the top-k
+compressed rows of each token through the indexer's picks, with a mask of window + top-k columns instead of one over
+all compressed rows, which is written and scanned again in every compressed layer: 3% faster prefill and, on most
+GPUs, about 0.2 GB (512K) to 0.5 GB (1M) less memory (`LLAMA_DSV41_KV_SEL=0` turns this off).
 
 Prompt processing runs on all GPUs at once (pipeline parallelism: the next ubatch starts on the first GPU while the
 current one runs on the later ones). It is on with any multi-GPU layer split whose weights are all on the GPUs,

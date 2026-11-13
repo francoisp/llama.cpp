@@ -50,6 +50,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
     LLM_FUSED_OP_FLASH_ATTN_KV_PREFIX,
+    LLM_FUSED_OP_FLASH_ATTN_KV_SEL,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
@@ -1306,7 +1307,9 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * k_pre = nullptr, // [n_embd_head_k, n_head_k, n_pre, n_stream]: K/V rows ahead of k and v,
-            ggml_tensor * v_pre = nullptr  // read in place by flash attention (the mask has n_pre + n_kv columns)
+            ggml_tensor * v_pre = nullptr, // read in place by flash attention (the mask has n_pre + n_kv columns)
+            ggml_tensor * kv_sel = nullptr // [n_sel, n_tokens/n_stream, 1, n_stream] i32: the rows of k and v of each
+                                           // query (the mask has n_pre + n_sel columns), flash attention only
             ) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;

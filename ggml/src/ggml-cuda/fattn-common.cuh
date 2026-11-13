@@ -20,12 +20,16 @@
 
 // K/V rows ahead of the K/V rows (ggml_flash_attn_ext_add_kv_prefix): column i < n of the mask uses row i of these,
 // column n + j row j of K/V. Only the sparse gather of the mma kernel reads them, the other paths get one copy.
+// With K/V rows chosen per query (ggml_flash_attn_ext_add_kv_sel) the index list of a query holds its visible mask
+// columns in the order of their rows and the K/V row of each column ([prefix | K/V], as without kv_sel) follows at
+// rows_off; only the single-query sparse gather reads them.
 struct fattn_kv_prefix {
     const char * K;
     const char * V;
     int32_t n;
     int32_t nb11; int32_t nb12; int64_t nb13;
     int32_t nb21; int32_t nb22; int64_t nb23;
+    int64_t rows_off;
 };
 
 typedef void (* fattn_kernel_t)(
@@ -788,6 +792,15 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// kv_sel (ggml_flash_attn_ext_add_kv_sel), one list per query: the visible mask columns in the order of their K/V rows
+// (ascending, as the lists of a mask over all rows), the count, the K/V row of each listed column
+void ggml_cuda_flash_attn_ext_compact_mask_kv_sel(
+        const ggml_tensor * mask, const ggml_tensor * kv_sel, int64_t n_pre, int64_t n_kv, int32_t * indices, int32_t * counts,
+        int32_t * rows, int32_t n_queries, int32_t n_kv_max, cudaStream_t stream);
+
+// the largest window + chosen columns per query that ggml_cuda_flash_attn_ext_compact_mask_kv_sel sorts
+#define FATTN_KV_SEL_SORT_MAX 4096
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1225,6 +1238,10 @@ void launch_fattn(
         }
     }
 
+    // K/V rows chosen per query: ggml_cuda_flash_attn_ext expands the mask for every other path
+    const ggml_tensor * kv_sel = dst->src[8];
+    GGML_ASSERT(!kv_sel || (use_sparse && ncols1 == 1));
+
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1240,8 +1257,17 @@ void launch_fattn(
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        if (kv_sel) {
+            // the lists of mask columns, their counts, the lists of K/V rows
+            KV_max.alloc(2*size_t(n_kv_max)*n_lists + n_lists);
+            kv_pre.rows_off = int64_t(n_kv_max)*n_lists + n_lists;
+            const int64_t n_pre = K_pre ? K_pre->ne[1] : 0;
+            ggml_cuda_flash_attn_ext_compact_mask_kv_sel(mask, kv_sel, n_pre, K->ne[1] - n_pre, KV_max.ptr,
+                KV_max.ptr + size_t(n_kv_max)*n_lists, KV_max.ptr + kv_pre.rows_off, Q->ne[1], n_kv_max, main_stream);
+        } else {
+            KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
