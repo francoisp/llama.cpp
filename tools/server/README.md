@@ -418,12 +418,12 @@ If your host reaches the internet through a corporate proxy, export `HTTP_PROXY`
 ### DeepSeek V4.1 on several GPUs
 
 The settings below were measured on 8 RTX 3090 / 3090 Ti (24 GB each) with the UD-IQ2_XXS quantization and the
-DSpark Q8_0 draft model, at 512K context:
+DSpark Q8_0 draft model, at the whole 1M context of the model:
 
 ```sh
 llama-server -m DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
     -md dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf --spec-type draft-dspark \
-    --mmproj mmproj-F16.gguf -c 526000 -t 12 -tb 12
+    --mmproj mmproj-F16.gguf -t 12 -tb 12
 ```
 
 For a DeepSeek V4.1 model the server sets these when they are not given (on the command line or by their
@@ -431,6 +431,7 @@ environment variable), and logs the ones it applied:
 
 | Default | Why |
 | --- | --- |
+| `-c 0` | the whole context of the model (1M); with `-c` unset `--fit` would shrink the context to fit (690K on these GPUs with the draft model), with `-c 0` it measures the smaller prompt graph and halves the ubatch first |
 | `-ub 256` | 15% faster prefill than 128, with compute buffers small enough for 512K context; `--fit` uses 128 when 256 would leave weights in host memory |
 | `-fitt 384` | leaves room on each GPU for the pipeline parallelism buffers next to the draft model; with 512 or more `--fit` falls back to the layout without pipeline parallelism |
 | `-np 4 --kv-unified` (auto) | the shared KV pool (below): 4 slots share the context, each can grow to all of it |
@@ -438,17 +439,22 @@ environment variable), and logs the ones it applied:
 | `--spec-draft-n-max 4` | with DSpark: 8% faster decode than 3 at 131K (93% of the drafts accepted), the same at 16K; 5 is slower |
 | `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
 
-`-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` is no faster at 512K (and fits only with
-`LLAMA_PIPELINE_PARALLEL=1`). Expected speeds with these settings:
-prefill 700-1000 t/s up to 131K (a 524K prompt in about 15 minutes), decode with drafts about 92 t/s at 131K and
-71 t/s at 524K.
+`-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` is no faster at 512K. Expected speeds with these
+settings, in one conversation growing to 950K:
 
-The whole 1M context of the model fits too (`-c 1048576`, same command otherwise), with `-ub 256`, every weight on the
-8 GPUs, the draft model and pipeline parallelism. A 950K prompt takes 26 minutes (621 t/s), decode with drafts stays
-at about 72 t/s at 950K. At that length `--fit` sizes the layout to the smaller prompt graph, in which the indexer and
-the sparse attention mask read the count of visible compressed rows of each token instead of a 512 MiB mask
-(`LLAMA_DSV41_MASK_COUNT=0` turns this off); up to 512K it keeps the layout of the larger graph, which spreads the
-layers for faster prefill, and the run just has more free memory. At any length, flash attention reads the top-k
+| Context | Prefill (new tokens) | Decode with drafts | Decode without drafts |
+| --- | --- | --- | --- |
+| 4K - 131K | 690 - 750 t/s | 83 - 92 t/s | 44 - 45 t/s |
+| 262K | 636 t/s | 85 t/s | 44 t/s |
+| 524K | 640 t/s | 70 t/s | 43 t/s |
+| 950K | 561 t/s | 74 t/s | 42 t/s |
+
+A 950K prompt takes about 26 minutes. Everything fits on the 8 GPUs at 1M: every weight, the draft model and
+pipeline parallelism, with `-ub 256`. At that length `--fit` sizes the layout to the smaller prompt graph, in which
+the indexer and the sparse attention mask read the count of visible compressed rows of each token instead of a
+512 MiB mask (`LLAMA_DSV41_MASK_COUNT=0` turns this off); with a smaller context (`-c 526000`) it keeps the layout of
+the larger graph, which spreads the layers differently (about 4% faster decode with drafts at 16K-131K, the same
+prefill). At any length, flash attention reads the top-k
 compressed rows of each token through the indexer's picks, with a mask of window + top-k columns instead of one over
 all compressed rows, which is written and scanned again in every compressed layer: 3% faster prefill and, on most
 GPUs, about 0.2 GB (512K) to 0.5 GB (1M) less memory (`LLAMA_DSV41_KV_SEL=0` turns this off).
@@ -464,8 +470,8 @@ generating slots keep going. Speculative decoding can be turned off for the whol
 #### Several slots: the shared KV pool
 
 With `--kv-unified` and several slots (the default above), the slots share one context of `-c` tokens instead of
-getting `n_ctx/N` each: a main agent can use 512K while subagents run next to it, as long as all the slots together
-stay within the context. The compressed KV of each slot takes device memory only for the rows it uses (CUDA virtual
+getting `n_ctx/N` each: a main agent can use most of the 1M context while subagents run next to it, as long as all
+the slots together stay within the context. The compressed KV of each slot takes device memory only for the rows it uses (CUDA virtual
 memory, in 2 MiB pieces), from a budget of one context per GPU, so `--fit` lays out the model as for a single slot and
 a single slot is as fast as with `-np 1`. Without CUDA virtual memory management the server keeps `-np 1`;
 `LLAMA_DSV4_SHARED_POOL=0` turns the pool off.

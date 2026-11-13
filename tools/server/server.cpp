@@ -141,6 +141,14 @@ static void server_apply_deepseek41_defaults(common_params & params) {
     const auto is_set = [&](const char * name) { return params.args_set.count(name) > 0; };
     std::vector<std::string> applied;
 
+    // the whole context of the model (1M), as with -c 0: --fit then halves the ubatch or measures the smaller prompt
+    // graph instead of shrinking the context, which it does when -c is left unset
+    if (!is_set("-c") && !is_set("-fitc") && !is_set("--kv-unified-per-slot")) {
+        params.n_ctx              = 0;
+        params.fit_params_min_ctx = UINT32_MAX;
+        applied.push_back("-c 0 (the whole context of the model)");
+    }
+
     // 256-token ubatches: 15% faster prefill than 128 and small enough compute buffers for 512K context; --fit
     // halves them (to 128) rather than keep weights in host memory, as at 1M context
     if (!is_set("-ub")) {
