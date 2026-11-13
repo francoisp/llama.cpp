@@ -1305,7 +1305,29 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     const llama_context_params cparams_dft0 = cparams_dft;
     const std::vector<float>   split0(params.tensor_split, params.tensor_split + 128);
     const auto                 overrides0   = params.tensor_buft_overrides;
+    // common_fit_params fits again without pipeline parallelism when a layout keeps weights in host memory; while the
+    // smaller graph or a smaller ubatch is still left to try, it keeps pipeline parallelism instead (a value of
+    // LLAMA_PIPELINE_PARALLEL other than 0 does that and changes nothing else), which is worth more than either:
+    // DeepSeek V4.1 prefill is 1.75x with it, 3.5% (smaller graph) and 15% (half the ubatch) slower without them
+    const auto set_pp = [](const char * v) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_PIPELINE_PARALLEL", v ? v : "");
+#else
+        if (v) {
+            setenv("LLAMA_PIPELINE_PARALLEL", v, 1);
+        } else {
+            unsetenv("LLAMA_PIPELINE_PARALLEL");
+        }
+#endif
+    };
+    bool pp_held = false;
     while (true) {
+        const bool last = !large_graph &&
+            (params.fit_ubatch_min <= 0 || cparams.n_ubatch / 2 < (uint32_t) params.fit_ubatch_min);
+        pp_held = !pp_env && !last;
+        if (pp_held) {
+            set_pp("1");
+        }
         common_fit_params(params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
@@ -1334,13 +1356,12 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         std::copy(split0.begin(), split0.end(), params.tensor_split);
         params.tensor_buft_overrides = overrides0;
         if (!pp_env) {
-#ifdef _WIN32
-            _putenv_s("LLAMA_PIPELINE_PARALLEL", "");
-#else
-            unsetenv("LLAMA_PIPELINE_PARALLEL");
-#endif
+            set_pp(nullptr);
         }
         cparams.n_ubatch = params.n_ubatch = n_ubatch;
+    }
+    if (pp_held) {
+        set_pp(nullptr); // the layout kept every weight on the devices: the context decides as without --fit
     }
     if (large_graph) {
         set_large_graph(false);
