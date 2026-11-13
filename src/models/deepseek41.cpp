@@ -804,6 +804,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     ggml_tensor * src_rows = ggml_view_3d(ctx0, comp_all, n_embd_head, n_comp, n_stream, comp_all->nb[2], comp_all->nb[3], 0);
                     comp_k = ggml_get_rows(ctx0, src_rows, sel);
                 }
+                // gather on the device of the storage layer: a layer on another device would get a copy of the whole
+                // source view, which with several streams spans their full stride (the shared KV pool reserves the
+                // whole context per stream: 3.85 GB per input copy for 4 streams at 1M context)
+                on_layer_dev(comp_k, rd);
                 comp_k = ggml_reshape_4d(ctx0, comp_k, n_embd_head, 1, k_sel, nt); // F32 (get_rows dequantizes)
                 if (k_rot) {
                     // quantized K cache: the window is stored rotated, the compressed rows are not
