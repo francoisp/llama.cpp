@@ -437,6 +437,7 @@ environment variable), and logs the ones it applied:
 | `-np 4 --kv-unified` (auto) | the shared KV pool (below): 4 slots share the context, each can grow to all of it |
 | `-devd <last GPU> -ngld all` | the draft model whole on the GPU that `--fit` gives the fewest layers |
 | `--spec-draft-n-max 4` | with DSpark: 8% faster decode than 3 at 131K (93% of the drafts accepted), the same at 16K; 5 is slower |
+| `--spec-max-slots 5` | with DSpark: drafts while up to 4 slots generate; 3 users decode 114 t/s in total with drafts instead of 88 without, 4 users 122 instead of 102 (92% of the drafts accepted) |
 | `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
 
 `-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` is no faster at 512K. Expected speeds with these
@@ -465,7 +466,7 @@ including the layouts of `--fit`; if `--fit` has to keep weights in host memory 
 `LLAMA_PIPELINE_PARALLEL=0` turns it off, `GGML_SCHED_N_COPIES` (default 2, at most 4) sets how many ubatches are in
 flight. While other slots generate, prompts are processed one ubatch at a time (`--prefill-share`), so that the
 generating slots keep going. Speculative decoding can be turned off for the whole server with `POST /speculative`
-(or the toggle in the web UI), and pauses by itself while 3 or more slots generate (`--spec-max-slots`).
+(or the toggle in the web UI), and pauses by itself while 5 or more slots generate (`--spec-max-slots`).
 
 #### Several slots: the shared KV pool
 
