@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#include <deque>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -57,6 +58,12 @@
 #if !defined(_WIN32)
 #include <sys/types.h>
 #include <pwd.h>
+#endif
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <sys/stat.h>
+extern char ** environ;
 #endif
 
 #if defined(_AIX)
@@ -1236,6 +1243,335 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+//
+// --fit layout cache
+//
+// The fit measures many layouts (DeepSeek V4.1 on 8 GPUs at 1M context: 100 s of a 145 s startup) and comes to the same
+// result for the same inputs. The result is kept in a small file under <cache>/fit, keyed by what the fit reads: the
+// command line, the LLAMA_/GGML_/CUDA_ environment, the effective model and context params, the model files, the build
+// (executable and libraries) and the devices. It is used again only while the free memory of every GPU is within
+// 128 MiB of the memory it was fitted to. LLAMA_FIT_CACHE=0 fits every time. Linux only.
+
+struct common_fit_cache {
+    bool                  on = false;
+    std::string           key;      // what the fit reads, one item per line
+    std::filesystem::path file;
+    std::vector<int64_t>  free_mib; // free memory of each GPU before the fit
+};
+
+static std::vector<int64_t> common_fit_cache_free_mib() {
+    std::vector<int64_t> res;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        res.push_back((int64_t) (free / (1024*1024)));
+    }
+    return res;
+}
+
+#if defined(__linux__)
+static std::string common_fit_cache_file_id(const std::string & path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        return path + " missing";
+    }
+    return path + " " + std::to_string((long long) st.st_size) + " " + std::to_string((long long) st.st_mtim.tv_sec) + "." +
+        std::to_string((long long) st.st_mtim.tv_nsec);
+}
+
+// every shard of a split GGUF
+static void common_fit_cache_add_models(std::string & key, const char * what, const std::vector<std::string> & paths) {
+    static const std::regex re_split("-(\\d{5})-of-(\\d{5})\\.gguf$");
+    for (const auto & p : paths) {
+        std::smatch m;
+        if (std::regex_search(p, m, re_split)) {
+            const int         n    = std::stoi(m[2].str());
+            const std::string base = p.substr(0, m.position(0));
+            for (int i = 1; i <= n; ++i) {
+                key += std::string(what) + " " + common_fit_cache_file_id(base + string_format("-%05d-of-%05d.gguf", i, n)) + "\n";
+            }
+        } else {
+            key += std::string(what) + " " + common_fit_cache_file_id(p) + "\n";
+        }
+    }
+}
+#endif
+
+static bool common_fit_cache_init(common_fit_cache & c, const common_params & params, const llama_model_params & mparams,
+        const llama_context_params & cparams, const std::vector<std::string> & paths_dft) {
+#if defined(__linux__)
+    if (common_get_env("LLAMA_FIT_CACHE") == "0") {
+        return false;
+    }
+    std::error_code ec;
+    std::string & k = c.key;
+
+    k  = "llama.cpp fit cache 1\n";
+    k += string_format("build %d %s\n", llama_build_number(), llama_commit());
+    const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    k += "exe " + (ec ? std::string("unknown") : common_fit_cache_file_id(exe.string())) + "\n";
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void *>(&common_fit_apply), &info) && info.dli_fname) {
+        // the shared libraries next to libllama-common: libllama, libggml-*
+        const auto dir = std::filesystem::absolute(info.dli_fname, ec).parent_path();
+        std::vector<std::string> libs;
+        for (auto it = std::filesystem::directory_iterator(dir, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.find(".so") != std::string::npos && it->is_regular_file()) {
+                libs.push_back(it->path().string());
+            }
+        }
+        std::sort(libs.begin(), libs.end());
+        for (const auto & l : libs) {
+            k += "lib " + common_fit_cache_file_id(l) + "\n";
+        }
+    }
+    {
+        std::ifstream f("/proc/self/cmdline", std::ios::binary);
+        std::string args((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::replace(args.begin(), args.end(), '\0', '\x1f');
+        std::replace(args.begin(), args.end(), '\n', '\x1f');
+        k += "args " + args + "\n";
+    }
+    std::vector<std::string> envs;
+    for (char ** e = environ; e && *e; ++e) {
+        std::string v = *e;
+        if (v.rfind("LLAMA_FIT_CACHE", 0) == 0) {
+            continue;
+        }
+        for (const char * prefix : { "LLAMA_", "GGML_", "CUDA_", "HIP_", "ROCR_", "GPU_" }) {
+            if (v.rfind(prefix, 0) == 0) {
+                std::replace(v.begin(), v.end(), '\n', '\x1f');
+                envs.push_back(v);
+                break;
+            }
+        }
+    }
+    std::sort(envs.begin(), envs.end());
+    for (const auto & v : envs) {
+        k += "env " + v + "\n";
+    }
+    k += string_format("ctx n_ctx=%u n_batch=%u n_ubatch=%u n_seq_max=%u kv_unified=%d type_k=%d type_v=%d fa=%d kqv=%d op_offload=%d swa_full=%d n_rs_seq=%u\n",
+        cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_seq_max, (int) cparams.kv_unified, (int) cparams.type_k,
+        (int) cparams.type_v, (int) cparams.flash_attn_type, (int) cparams.offload_kqv, (int) cparams.op_offload,
+        (int) cparams.swa_full, cparams.n_rs_seq);
+    k += string_format("mparams ngl=%d split_mode=%d main_gpu=%d load_mode=%d\n",
+        mparams.n_gpu_layers, (int) mparams.split_mode, mparams.main_gpu, (int) mparams.load_mode);
+    k += string_format("fit min_ctx=%u ub_min=%d large_graph=%d targets", params.fit_params_min_ctx, params.fit_ubatch_min,
+        (int) params.fit_large_graph);
+    for (size_t t : params.fit_params_target) {
+        k += string_format(" %zu", t/(1024*1024));
+    }
+    k += "\n";
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        k += string_format("dev %s|%s|%d|%zu\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+            (int) ggml_backend_dev_type(dev), total/(1024*1024));
+    }
+    common_fit_cache_add_models(k, "model", params.model.get_paths());
+    common_fit_cache_add_models(k, "draft", paths_dft);
+
+    uint64_t h = 0xcbf29ce484222325ULL; // FNV-1a
+    for (unsigned char ch : k) {
+        h = (h ^ ch) * 0x100000001b3ULL;
+    }
+    c.file     = fs_get_cache_directory() / "fit" / string_format("layout-%016llx.txt", (unsigned long long) h);
+    c.free_mib = common_fit_cache_free_mib();
+    c.on       = true;
+    return true;
+#else
+    GGML_UNUSED(c);
+    GGML_UNUSED(params);
+    GGML_UNUSED(mparams);
+    GGML_UNUSED(cparams);
+    GGML_UNUSED(paths_dft);
+    return false;
+#endif
+}
+
+static ggml_backend_buffer_type_t common_fit_cache_buft(const std::string & name) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        for (ggml_backend_buffer_type_t b : { ggml_backend_dev_buffer_type(dev), ggml_backend_dev_host_buffer_type(dev) }) {
+            if (b && name == ggml_backend_buft_name(b)) {
+                return b;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// apply a cached layout: true if one was found for these inputs and the free memory still matches
+static bool common_fit_cache_load(const common_fit_cache & c, common_params & params, llama_model_params & mparams,
+        llama_context_params & cparams, bool pp_env) {
+    std::ifstream f(c.file);
+    if (!f) {
+        return false;
+    }
+    std::string line;
+    std::string key;
+    if (!std::getline(f, line) || line != "begin-key") {
+        return false;
+    }
+    while (std::getline(f, line) && line != "end-key") {
+        key += line + "\n";
+    }
+    if (key != c.key) {
+        return false; // a hash collision
+    }
+
+    std::vector<int64_t> free_mib;
+    int32_t              ngl      = 0;
+    bool                 has_split = false;
+    std::vector<float>   split;
+    uint32_t             n_ctx    = 0;
+    uint32_t             n_ubatch = 0;
+    int                  pp_off   = 0;
+    std::string          saved;
+    std::vector<std::pair<std::string, std::string>> ovr; // buffer type, pattern
+    while (std::getline(f, line)) {
+        std::istringstream ls(line);
+        std::string what;
+        ls >> what;
+        if (what == "free") {
+            int64_t v;
+            while (ls >> v) {
+                free_mib.push_back(v);
+            }
+        } else if (what == "ngl") {
+            ls >> ngl;
+        } else if (what == "split") {
+            std::string n;
+            ls >> n;
+            if (n != "-") {
+                has_split = true;
+                float v;
+                while (ls >> v) {
+                    split.push_back(v);
+                }
+            }
+        } else if (what == "n_ctx") {
+            ls >> n_ctx;
+        } else if (what == "n_ubatch") {
+            ls >> n_ubatch;
+        } else if (what == "pp_off") {
+            ls >> pp_off;
+        } else if (what == "ovr") {
+            const size_t tab = line.find('\t');
+            if (tab == std::string::npos) {
+                return false;
+            }
+            ovr.emplace_back(line.substr(4, tab - 4), line.substr(tab + 1));
+        } else if (what == "saved") {
+            saved = line.size() > 6 ? line.substr(6) : "";
+        }
+    }
+    if (n_ctx == 0 || n_ubatch == 0 || free_mib.size() != c.free_mib.size() || split.size() > 128 ||
+            ovr.size() + 1 > params.tensor_buft_overrides.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < free_mib.size(); ++i) {
+        if (std::abs(free_mib[i] - c.free_mib[i]) > 128) {
+            COM_INF("the free memory of the GPUs differs from the cached --fit layout's (GPU %zu: %" PRId64 " MiB now, %" PRId64 " MiB then), fitting again\n",
+                i, c.free_mib[i], free_mib[i]);
+            return false;
+        }
+    }
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    for (const auto & o : ovr) {
+        ggml_backend_buffer_type_t b = common_fit_cache_buft(o.first);
+        if (!b) {
+            return false;
+        }
+        bufts.push_back(b);
+    }
+
+    // the strings the overrides point at
+    static std::deque<std::string> patterns;
+
+    mparams.n_gpu_layers = ngl;
+    if (has_split) {
+        std::fill(params.tensor_split, params.tensor_split + 128, 0.0f);
+        std::copy(split.begin(), split.end(), params.tensor_split);
+        mparams.tensor_split = params.tensor_split;
+    }
+    for (size_t i = 0; i < ovr.size(); ++i) {
+        patterns.push_back(ovr[i].second);
+        params.tensor_buft_overrides[i] = { patterns.back().c_str(), bufts[i] };
+    }
+    params.tensor_buft_overrides[ovr.size()] = { nullptr, nullptr };
+    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    cparams.n_ctx    = n_ctx;
+    cparams.n_ubatch = params.n_ubatch = n_ubatch;
+    if (pp_off && !pp_env) {
+#ifdef _WIN32
+        _putenv_s("LLAMA_PIPELINE_PARALLEL", "0");
+#else
+        setenv("LLAMA_PIPELINE_PARALLEL", "0", 1);
+#endif
+    }
+    COM_INF("using the --fit layout cached on %s for this command, model and free memory (%s; LLAMA_FIT_CACHE=0 fits again)\n",
+        saved.c_str(), c.file.string().c_str());
+    return true;
+}
+
+static void common_fit_cache_save(const common_fit_cache & c, const llama_model_params & mparams,
+        const llama_context_params & cparams, bool pp_env) {
+    std::error_code ec;
+    std::filesystem::create_directories(c.file.parent_path(), ec);
+    if (ec) {
+        return;
+    }
+    const std::string tmp = c.file.string() + string_format(".tmp%d", (int) getpid());
+    {
+        std::ofstream f(tmp);
+        f << "begin-key\n" << c.key << "end-key\n";
+        f << "free";
+        for (int64_t m : c.free_mib) {
+            f << " " << m;
+        }
+        f << "\n";
+        f << "ngl " << mparams.n_gpu_layers << "\n";
+        if (mparams.tensor_split) {
+            f << "split " << ggml_backend_dev_count();
+            for (size_t i = 0; i < std::min<size_t>(ggml_backend_dev_count(), 128); ++i) {
+                f << string_format(" %.9g", mparams.tensor_split[i]);
+            }
+            f << "\n";
+        } else {
+            f << "split -\n";
+        }
+        f << "n_ctx " << cparams.n_ctx << "\n";
+        f << "n_ubatch " << cparams.n_ubatch << "\n";
+        const char * pp = getenv("LLAMA_PIPELINE_PARALLEL");
+        f << "pp_off " << (!pp_env && pp && atoi(pp) == 0 ? 1 : 0) << "\n";
+        for (const auto * o = mparams.tensor_buft_overrides; o && o->pattern; ++o) {
+            f << "ovr " << ggml_backend_buft_name(o->buft) << "\t" << o->pattern << "\n";
+        }
+        const std::time_t now = std::time(nullptr);
+        char when[64];
+        std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+        f << "saved " << when << "\n";
+        if (!f) {
+            f.close();
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, c.file, ec);
+    if (!ec) {
+        COM_INF("saved the --fit layout to %s\n", c.file.string().c_str());
+    }
+}
+
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (!params.fit_params) {
         return;
@@ -1279,6 +1615,14 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         return false;
     };
     const bool pp_env = getenv("LLAMA_PIPELINE_PARALLEL") != nullptr;
+
+    // the layout found earlier for the same inputs and free memory
+    common_fit_cache cache;
+    if (common_fit_cache_init(cache, params, mparams, cparams, extra.paths_model) &&
+            common_fit_cache_load(cache, params, mparams, cparams, pp_env)) {
+        return;
+    }
+
     // with fit_large_graph the first layout is fitted to the prompt graph without its memory-saving variants
     // (LLAMA_FIT_LARGE_GRAPH=1 while fitting, see deepseek41): when that layout keeps every weight on the devices it is
     // kept and the run just has more free memory; the saved memory changes the layer split, which costs speed when
@@ -1321,6 +1665,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 #endif
     };
     bool pp_held = false;
+    common_params_fit_status fit_status = COMMON_PARAMS_FIT_STATUS_ERROR;
     while (true) {
         const bool last = !large_graph &&
             (params.fit_ubatch_min <= 0 || cparams.n_ubatch / 2 < (uint32_t) params.fit_ubatch_min);
@@ -1328,7 +1673,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         if (pp_held) {
             set_pp("1");
         }
-        common_fit_params(params.model.get_paths(), &mparams, &cparams,
+        fit_status = common_fit_params(params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
@@ -1365,6 +1710,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     }
     if (large_graph) {
         set_large_graph(false);
+    }
+    if (cache.on && fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        common_fit_cache_save(cache, mparams, cparams, pp_env);
     }
 }
 

@@ -440,6 +440,11 @@ environment variable), and logs the ones it applied:
 | `--spec-max-slots 5` | with DSpark: drafts while up to 4 slots generate; 3 users decode 114 t/s in total with drafts instead of 88 without, 4 users 122 instead of 102 (92% of the drafts accepted) |
 | `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
 
+The first start takes about 2.5 minutes, 100 s of it `--fit` measuring layouts. The layout it finds is kept in
+`~/.cache/llama.cpp/fit` (`LLAMA_CACHE/fit`) and used again by the next start with the same command line, environment,
+model files and build, while the free memory of every GPU is within 128 MiB of what it was: that start is ready in
+about 40 s, with the same layout. `LLAMA_FIT_CACHE=0` fits every time.
+
 `-b` stays at 2048 (4096 and 8192 are no faster), `-ub 512` is no faster at 512K. Expected speeds with these
 settings, in one conversation growing to 950K:
 
