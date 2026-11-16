@@ -54,7 +54,6 @@ struct llama_cparams {
     bool fused_kv_sel;       // flash attention reads K/V rows chosen per query (ggml_flash_attn_ext_add_kv_sel)
     bool auto_fkvs;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
@@ -76,6 +75,6 @@ struct llama_cparams {
 
     llama_context * ctx_other;
 
-    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_embd_state_src()
+    // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
 };

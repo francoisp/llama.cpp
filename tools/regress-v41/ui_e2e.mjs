@@ -1,5 +1,5 @@
 // browser checks of the web UI against a running server: node ui_e2e.mjs <server url> <steering vector file>
-// run from tools/ui (uses its @playwright/test); prints one PASS/FAIL line per check
+// run from ui/apps/chat (uses its @playwright/test); prints one PASS/FAIL line per check
 import { createRequire } from 'module';
 import path from 'path';
 

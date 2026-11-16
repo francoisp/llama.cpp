@@ -377,9 +377,9 @@ def run_server(ref, new, update, log_dir, with_ui):
 # ----------------------------------------------------------------------------------------------------------------- ui
 
 def run_ui_unit():
-    ui = os.path.join(ROOT, 'tools', 'ui')
+    ui = os.path.join(ROOT, 'ui', 'apps', 'chat')
     if not os.path.exists(os.path.join(ui, 'node_modules')):
-        report('ui', 'unit', None, 'tools/ui/node_modules missing (npm ci)')
+        report('ui', 'unit', None, 'ui/apps/chat/node_modules missing (npm ci)')
         return
     t0 = time.time()
     p = subprocess.run(['npx', 'vitest', 'run', '--project', 'unit'], cwd=ui, capture_output=True, text=True)
@@ -390,14 +390,14 @@ def run_ui_unit():
 
 
 def run_ui_e2e(srv):
-    ui = os.path.join(ROOT, 'tools', 'ui')
+    ui = os.path.join(ROOT, 'ui', 'apps', 'chat')
     script = os.path.join(os.path.dirname(__file__), 'ui_e2e.mjs')
     if not os.path.exists(os.path.join(ui, 'node_modules', '@playwright', 'test')):
         report('ui', 'browser', None, '@playwright/test not installed')
         return
     p = subprocess.run(['node', script, srv.url, CFG['steer_vec']], cwd=ui, capture_output=True, text=True, timeout=600)
     if "Executable doesn't exist" in p.stdout + p.stderr:
-        report('ui', 'browser', None, 'no browser for Playwright (npx playwright install chromium, in tools/ui)')
+        report('ui', 'browser', None, 'no browser for Playwright (npx playwright install chromium, in ui/apps/chat)')
         return
     lines = [l for l in (p.stdout + p.stderr).splitlines() if l.startswith(('PASS', 'FAIL'))]
     for l in lines:

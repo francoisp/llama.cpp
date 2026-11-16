@@ -34,5 +34,5 @@ exit code is 1 if any check fails. Logs of every run are kept next to the refere
 | `REGRESS_PORT`, `REGRESS_OPS_BACKEND`, `REGRESS_SPEED_TOL` | `18490`, `CUDA0`, `0.85` |
 
 The server section needs the GPUs to itself: it stops if another `llama-server` is running. Build
-`llama-server` and `test-backend-ops` first, and run `npm ci` in `tools/ui` for the UI section
+`llama-server` and `test-backend-ops` first, and run `npm ci` in `ui/apps/chat` for the UI section
 (`npx playwright install chromium` for the browser checks).
