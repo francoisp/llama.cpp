@@ -66,6 +66,8 @@ export default defineConfig(({ mode }) => {
 				'/models': SERVER_ORIGIN,
 				'/props': SERVER_ORIGIN,
 				'/slots': SERVER_ORIGIN,
+				'/speculative': SERVER_ORIGIN,
+				'/steering': SERVER_ORIGIN,
 				'/tools': SERVER_ORIGIN,
 				'/v1': SERVER_ORIGIN
 			}
