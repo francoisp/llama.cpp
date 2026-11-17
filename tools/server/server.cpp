@@ -210,6 +210,15 @@ static void server_apply_deepseek41_defaults(common_params & params) {
         applied.push_back("--kv-unified (shared KV pool)");
     }
 
+    // the maximum reasoning effort (100), at which DeepSeek's published scores are measured: the template default is
+    // high (75), which Artificial Analysis scores 4 points lower on its index (29 vs 33); a request can still pick
+    // another level, and --reasoning off or a reasoning_effort in --chat-template-kwargs keeps its own choice
+    if (!is_set("--reasoning-effort") && params.enable_reasoning != 0 &&
+        params.default_template_kwargs.count("reasoning_effort") == 0) {
+        params.default_template_kwargs["reasoning_effort"] = "\"max\"";
+        applied.push_back("--reasoning-effort max");
+    }
+
     // the projector on the CPU: on a GPU it takes the room of expert weights, which slows every token down
     // (an image takes 4-5 s on the CPU instead of about 1 s)
     if (!params.mmproj.path.empty() && !is_set("--no-mmproj-offload")) {

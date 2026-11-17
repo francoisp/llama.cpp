@@ -442,6 +442,7 @@ environment variable), and logs the ones it applied:
 | `-devd <last GPU> -ngld all` | the draft model whole on the GPU that `--fit` gives the fewest layers |
 | `--spec-draft-n-max 4` | with DSpark: 8% faster decode than 3 at 131K (93% of the drafts accepted), the same at 16K; 5 is slower |
 | `--spec-max-slots 5` | with DSpark: drafts while up to 4 slots generate; 3 users decode 114 t/s in total with drafts instead of 88 without, 4 users 122 instead of 102 (92% of the drafts accepted) |
+| `--reasoning-effort max` | the effort (100) at which DeepSeek's published scores are measured; the template default `high` (75) scores 29 instead of 33 on the Artificial Analysis Intelligence Index, with shorter answers. A request (`reasoning_effort`) or the web UI can still pick another level; changing it mid-conversation re-reads the whole prompt |
 | `--no-mmproj-offload` | on a GPU the projector takes the room of expert weights, slowing every token; an image takes 4-5 s on the CPU instead of about 1 s |
 
 The first start takes about 2.5 minutes, 100 s of it `--fit` measuring layouts. The layout it finds is kept in
