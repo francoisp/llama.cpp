@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { RefreshCw } from '@lucide/svelte';
 	import {
+		SettingsChatApiKeysTab,
 		SettingsChatDesktopSidebar,
 		SettingsChatFields,
 		SettingsChatImportExportTab,
@@ -18,7 +19,7 @@
 		SETTINGS_SECTION_SLUGS
 	} from '$lib/constants';
 	import { ColorMode } from '$lib/enums/ui.enums';
-	import { modelsStore, serverStore, settingsStore } from '$lib/stores';
+	import { authStore, modelsStore, serverStore, settingsStore } from '$lib/stores';
 	import type { SettingsSection, SettingsSectionTitle } from '$lib/types';
 	import { setMode } from 'mode-watcher';
 	import { fade } from 'svelte/transition';
@@ -34,8 +35,15 @@
 
 	let activeSlug = $derived(initialSection ?? 'general');
 
+	// the API keys section manages the server's keys, so only a key with the admin permission sees it
+	let sections = $derived(
+		SETTINGS_CHAT_SECTIONS.filter(
+			(section) => section.slug !== SETTINGS_SECTION_SLUGS.API_KEYS || authStore.isAdmin
+		)
+	);
+
 	function handleSectionChange(section: SettingsSectionTitle) {
-		const found = SETTINGS_CHAT_SECTIONS.find((s) => s.title === section);
+		const found = sections.find((s) => s.title === section);
 
 		if (found) {
 			activeSlug = found.slug;
@@ -45,8 +53,7 @@
 	}
 
 	let currentSection = $derived(
-		SETTINGS_CHAT_SECTIONS.find((section) => section.slug === activeSlug) ||
-			SETTINGS_CHAT_SECTIONS[0]
+		sections.find((section) => section.slug === activeSlug) || sections[0]
 	);
 
 	let localConfig: SettingsConfigType = $state({ ...settingsStore.config });
@@ -158,7 +165,7 @@
 		<SettingsChatDesktopSidebar
 			isActive={(section: SettingsSection) => section.slug === activeSlug}
 			onSectionChange={handleSectionChange}
-			sections={SETTINGS_CHAT_SECTIONS}
+			{sections}
 		/>
 
 		<SettingsChatMobileHeader
@@ -166,7 +173,7 @@
 			class={mobileHeaderClass}
 			isActive={(section: SettingsSection) => section.slug === activeSlug}
 			onSectionChange={handleSectionChange}
-			sections={SETTINGS_CHAT_SECTIONS}
+			{sections}
 		/>
 
 		<div class="mx-auto max-w-2xl px-4 flex-1 md:mt-4">
@@ -176,6 +183,8 @@
 						<SettingsChatToolsTab />
 					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.IMPORT_EXPORT}
 						<SettingsChatImportExportTab />
+					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.API_KEYS}
+						<SettingsChatApiKeysTab />
 					{:else if currentSection.fields}
 						<div class="space-y-6">
 							<SettingsChatFields

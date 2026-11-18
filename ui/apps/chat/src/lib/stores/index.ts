@@ -50,6 +50,9 @@ export { modelsDiscoverStore } from './models-discover/index.svelte';
 // SERVER
 export { serverStore } from './server.svelte';
 
+// API KEY PERMISSIONS (what the key in the settings may do)
+export { authStore } from './auth.svelte';
+
 // UI / LAYOUT
 export { uiStore } from './ui.svelte';
 

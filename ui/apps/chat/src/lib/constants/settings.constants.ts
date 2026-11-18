@@ -9,6 +9,7 @@ import {
 	Code,
 	Database,
 	Funnel,
+	KeyRound,
 	ListRestart,
 	Monitor,
 	Moon,
@@ -30,6 +31,7 @@ import type {
 /** Settings sections — slug is the routing identity, title is the display label. */
 export const SETTINGS_SECTIONS = {
 	AGENTIC: { slug: 'agentic', title: 'Agentic' },
+	API_KEYS: { slug: 'api-keys', title: 'API keys' },
 	DEVELOPER: { slug: 'developer', title: 'Developer' },
 	DISPLAY: { slug: 'display', title: 'Display' },
 	GENERAL: { slug: 'general', title: 'General' },
@@ -40,6 +42,7 @@ export const SETTINGS_SECTIONS = {
 
 export const SETTINGS_SECTION_SLUGS = {
 	AGENTIC: SETTINGS_SECTIONS.AGENTIC.slug,
+	API_KEYS: SETTINGS_SECTIONS.API_KEYS.slug,
 	DEVELOPER: SETTINGS_SECTIONS.DEVELOPER.slug,
 	DISPLAY: SETTINGS_SECTIONS.DISPLAY.slug,
 	GENERAL: SETTINGS_SECTIONS.GENERAL.slug,
@@ -50,6 +53,7 @@ export const SETTINGS_SECTION_SLUGS = {
 
 export const SETTINGS_SECTION_TITLES = {
 	AGENTIC: SETTINGS_SECTIONS.AGENTIC.title,
+	API_KEYS: SETTINGS_SECTIONS.API_KEYS.title,
 	DEVELOPER: SETTINGS_SECTIONS.DEVELOPER.title,
 	DISPLAY: SETTINGS_SECTIONS.DISPLAY.title,
 	GENERAL: SETTINGS_SECTIONS.GENERAL.title,
@@ -700,6 +704,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 		],
 		slug: SETTINGS_SECTION_SLUGS.DEVELOPER,
 		title: SETTINGS_SECTION_TITLES.DEVELOPER
+	},
+	// API keys (server side; shown only to a key with the admin permission)
+	{
+		icon: KeyRound,
+		settings: [],
+		slug: SETTINGS_SECTION_SLUGS.API_KEYS,
+		title: SETTINGS_SECTION_TITLES.API_KEYS
 	}
 ];
 

@@ -243,6 +243,45 @@ export interface ApiSpeculativeState {
 	max_slots: number;
 }
 
+// what an API key may do; admin implies every other permission
+export type ApiKeyPermission = 'chat' | 'steering' | 'control' | 'tools' | 'admin';
+
+export interface ApiKeyEntry {
+	// the first 12 hex digits of the key's SHA-256
+	id: string;
+	name: string;
+	// the last 4 characters of the key, when the server knows them
+	hint: string;
+	perms: ApiKeyPermission[];
+	disabled: boolean;
+	// the key file holds only its SHA-256
+	hashed: boolean;
+	// 'cli' keys come from --api-key and change only with a restart
+	source: 'file' | 'cli';
+	// the key the request was signed with (GET /keys only)
+	self?: boolean;
+}
+
+export interface ApiKeysMe extends Partial<ApiKeyEntry> {
+	// the server checks keys at all
+	auth: boolean;
+	admin: boolean;
+	// keys live in a file that an admin key can edit
+	key_file: boolean;
+	perms: ApiKeyPermission[];
+}
+
+export interface ApiKeysList {
+	key_file: string | null;
+	keys: ApiKeyEntry[];
+	perms: ApiKeyPermission[];
+}
+
+export interface ApiKeyCreated extends ApiKeyEntry {
+	// the new key, shown once: the server keeps only its SHA-256
+	key: string;
+}
+
 export interface ApiLlamaCppServerProps {
 	default_generation_settings: {
 		id: number;

@@ -2,6 +2,7 @@
 	import { Zap, ZapOff } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { SpeculativeService } from '$lib/services/speculative.service';
+	import { authStore } from '$lib/stores';
 	import type { ApiSpeculativeState } from '$lib/types';
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
@@ -16,6 +17,8 @@
 	let isBusy = $state(false);
 
 	let enabled = $derived(speculative?.enabled ?? false);
+	// the switch applies to the whole server, so a key needs the control permission to flip it
+	let canChange = $derived(authStore.can('control'));
 
 	onMount(async () => {
 		try {
@@ -47,11 +50,13 @@
 		aria-label="Speculative decoding"
 		aria-pressed={enabled}
 		class="-mr-px h-6 min-w-6 rounded-sm bg-transparent px-1 py-0 backdrop-blur-none! hover:bg-muted-foreground/15"
-		disabled={disabled || isBusy}
+		disabled={disabled || isBusy || !canChange}
 		onclick={toggle}
-		title={enabled
-			? 'Speculative decoding is on for the whole server (new requests). Click to turn it off.'
-			: 'Speculative decoding is off for the whole server (new requests). Click to turn it on.'}
+		title={!canChange
+			? `Speculative decoding is ${enabled ? 'on' : 'off'} for the whole server. Your API key cannot change it.`
+			: enabled
+				? 'Speculative decoding is on for the whole server (new requests). Click to turn it off.'
+				: 'Speculative decoding is off for the whole server (new requests). Click to turn it on.'}
 		variant="ghost"
 	>
 		{#if enabled}

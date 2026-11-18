@@ -4,6 +4,7 @@
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { SteeringService } from '$lib/services/steering.service';
+	import { authStore } from '$lib/stores';
 	import type { ApiSteeringState, ApiSteeringVector } from '$lib/types';
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
@@ -20,6 +21,8 @@
 	let vectors = $derived(steering?.available ?? []);
 	let active = $derived(vectors.find((vector) => vector.file === steering?.file));
 	let activeLabel = $derived(active?.label ?? steering?.file ?? null);
+	// steering applies to every slot, so a key needs the steering permission to change it
+	let canChange = $derived(authStore.can('steering'));
 
 	onMount(async () => {
 		try {
@@ -80,7 +83,7 @@
 		</DropdownMenu.Trigger>
 
 		<DropdownMenu.Content align="end" class="min-w-56">
-			<DropdownMenu.Item class="gap-3" onSelect={() => select(null)}>
+			<DropdownMenu.Item class="gap-3" disabled={!canChange} onSelect={() => select(null)}>
 				{#if !steering?.file}
 					<Check class="{ICON_CLASS_DEFAULT} shrink-0 text-foreground" />
 				{:else}
@@ -91,7 +94,7 @@
 			</DropdownMenu.Item>
 
 			{#each vectors as vector (vector.file)}
-				<DropdownMenu.Item class="gap-3" onSelect={() => select(vector.file)}>
+				<DropdownMenu.Item class="gap-3" disabled={!canChange} onSelect={() => select(vector.file)}>
 					{#if vector.file === steering?.file}
 						<Check class="{ICON_CLASS_DEFAULT} shrink-0 text-foreground" />
 					{:else}
@@ -108,7 +111,9 @@
 			<DropdownMenu.Separator />
 
 			<p class="px-2 py-1 text-[11px] text-muted-foreground">
-				Applies to new tokens, on every open chat
+				{canChange
+					? 'Applies to new tokens, on every open chat'
+					: 'Your API key cannot change the steering'}
 			</p>
 		</DropdownMenu.Content>
 	</DropdownMenu.Root>

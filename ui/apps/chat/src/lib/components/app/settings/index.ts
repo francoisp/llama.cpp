@@ -53,6 +53,12 @@ export { default as SettingsResetButton } from './SettingsResetButton.svelte';
 export { default as SettingsChatImportExportTab } from './SettingsChat/SettingsChatImportExportTab.svelte';
 
 /**
+ * API keys panel, for a key with the admin permission.
+ * Lists the server's keys and creates, edits, disables and deletes them through `/keys`.
+ */
+export { default as SettingsChatApiKeysTab } from './SettingsChat/SettingsChatApiKeysTab.svelte';
+
+/**
  * Section wrapper for import/export sections. Displays a title, description,
  * icon button, and optional summary of recent actions.
  */

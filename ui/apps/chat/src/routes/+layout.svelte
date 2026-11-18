@@ -24,6 +24,7 @@
 	import { useSidebarReveal } from '$lib/hooks/use-sidebar-reveal.svelte';
 	import { RouterService } from '$lib/services/router.service';
 	import {
+		authStore,
 		chatStore,
 		conversationsStore,
 		deviceStore,
@@ -305,6 +306,17 @@
 	// Monitor API key changes and redirect to error page if removed or changed when required
 	$effect(() => {
 		checkApiKey();
+	});
+
+	// what the key may do: steering, server-wide settings, managing keys
+	$effect(() => {
+		void settingsStore.config.apiKey;
+
+		if (!browser) return;
+
+		untrack(() => {
+			void authStore.refresh();
+		});
 	});
 </script>
 
