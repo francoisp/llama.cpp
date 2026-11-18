@@ -373,6 +373,8 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // API keys: who the caller is, and managing the key file with an admin key
+    ctx_http.register_auth_routes();
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -411,7 +413,8 @@ static bool server_setup_features(
         return res;
     };
 
-    if (params.cors_origins == "*" && params.api_keys.empty()) {
+    const bool no_api_key = params.api_keys.empty() && params.api_key_file.empty();
+    if (params.cors_origins == "*" && no_api_key) {
         SRV_WRN("%s", "security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)\n");
     }
 
@@ -420,7 +423,7 @@ static bool server_setup_features(
     const bool loopback_only = std::all_of(params.hostnames.begin(), params.hostnames.end(), [](const std::string & h) {
         return string_ends_with(h, ".sock") || h == "localhost" || h == "::1" || h == "[::1]" || string_starts_with(h, "127.");
     });
-    if (tools_enabled && !loopback_only && params.api_keys.empty() && !params.server_tools_allow_unauth) {
+    if (tools_enabled && !loopback_only && no_api_key && !params.server_tools_allow_unauth) {
         SRV_ERR("%s", "security: server tools, MCP servers or MCP proxy are enabled on a non-loopback address without an API key\n");
         SRV_ERR("%s", "set --api-key, bind to 127.0.0.1, or pass --allow-unauthenticated-tools on a trusted network\n");
         return false;

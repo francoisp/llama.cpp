@@ -216,7 +216,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
 | `--rerank, --reranking` | enable reranking endpoint on server (default: disabled)<br/>(env: LLAMA_ARG_RERANKING) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)<br/>(env: LLAMA_API_KEY) |
-| `--api-key-file FNAME` | path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)<br/>(env: LLAMA_ARG_API_KEY_FILE) |
+| `--api-key-file FNAME` | path to file containing API keys, one per line, optionally with permissions (KEY perms=chat,steering  # name); lines starting with a hash are comments, and the server re-reads the file when it changes (default: none)<br/>(env: LLAMA_ARG_API_KEY_FILE) |
 | `--ssl-key-file FNAME` | path to file a PEM-encoded SSL private key<br/>(env: LLAMA_ARG_SSL_KEY_FILE) |
 | `--ssl-cert-file FNAME` | path to file a PEM-encoded SSL certificate<br/>(env: LLAMA_ARG_SSL_CERT_FILE) |
 | `--chat-template-kwargs STRING` | sets additional params for the json template parser, must be a valid json object string, e.g. '{"key1":"value1","key2":"value2"}'<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_KWARGS) |
@@ -414,6 +414,50 @@ Recommended `--cors-origins` setting, depending on where the server runs:
 | Same machine | `--cors-origins localhost` (default once `--agent` is set) |
 
 Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-credentials` / `--no-cors-credentials`. Background and rationale: [#25655](https://github.com/ggml-org/llama.cpp/pull/25655).
+
+### API keys and permissions
+
+`--api-key-file` holds one key per line. The server reads the file again whenever it changes, so adding, changing
+or removing a key takes effect on the next request, without a restart:
+
+```
+# KEY  [perms=...]  [disabled]  # name
+llk-1c7e...9f40  perms=admin             # master
+llk-77ab...02de  perms=chat              # laptop
+llk-b4e1...6a1c  perms=chat,steering     # ci-runner
+sha256:5d0f...e3b2  perms=chat hint=91af  # created by the server: only the key's SHA-256 is stored
+```
+
+| Permission | Allows |
+| ---------- | ------ |
+| `chat`     | completions, chat, embeddings, tokenizing, and reading server state (`GET /props`, `/steering`, `/speculative`, `/models`, `/metrics`) |
+| `steering` | `POST /steering`: the steering applies to every slot, so it is the permission to keep from shared keys |
+| `control`  | other server-wide settings: `POST /speculative`, `POST /props`, `POST /lora-adapters`, `/slots` (it shows every user's prompt), router model load/unload |
+| `tools`    | `/tools` and `/cors-proxy` |
+| `admin`    | managing keys through `/keys`; implies every other permission |
+
+A key without `perms=` has every permission except `admin`, as every key had before permissions existed; so do keys
+given with `--api-key`, which cannot change without a restart. A line the server cannot read (an unknown
+permission or field) grants nothing, and a key file that is missing or unreadable grants nothing until it is back.
+
+With an `admin` key, the keys can also be managed over HTTP, or in Llama Chat under Settings > API keys:
+
+| Endpoint | Does |
+| -------- | ---- |
+| `GET /keys/me` | any key: its name, id and permissions |
+| `GET /keys` | lists the keys (never the keys themselves) |
+| `POST /keys` `{"name": "laptop", "perms": ["chat"]}` | creates a key and returns it once; the file stores only its SHA-256 |
+| `POST /keys/{id}` `{"name"?, "perms"?, "disabled"?}` | renames a key, changes its permissions, turns it off or on |
+| `DELETE /keys/{id}` | deletes a key |
+
+The server rewrites the file atomically with mode 600 and keeps its comments. An admin key cannot delete or disable
+itself or lose `admin` through the API, so the server always keeps one way in. To start, put one admin key in the
+file:
+
+```sh
+(umask 077; echo "llk-$(openssl rand -hex 32) perms=admin  # master" > ~/.config/llama/api-keys)
+llama-server ... --api-key-file ~/.config/llama/api-keys
+```
 
 ### Running behind a proxy
 

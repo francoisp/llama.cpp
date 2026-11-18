@@ -1,5 +1,6 @@
 #include "common.h"
 #include "http.h"
+#include "server-auth.h"
 #include "server-http.h"
 #include "server-common.h"
 #include "ui.h"
@@ -201,6 +202,12 @@ bool server_http_context::init(const common_params & params) {
     path_prefix = params.api_prefix;
     port = params.port;
 
+    auth = std::make_shared<server_auth>();
+    if (std::string err; !auth->init(params.api_keys, params.api_key_file, err)) {
+        SRV_ERR("%s\n", err.c_str());
+        return false;
+    }
+
     if (gcp.enabled) {
         SRV_TRC("Google Cloud Platform compat: health route = %s, predict route = %s, port = %d\n", gcp.path_health.c_str(), gcp.path_predict.c_str(), gcp.port);
 
@@ -313,14 +320,6 @@ bool server_http_context::init_listener(const common_params & params) {
         }
     });
 
-    if (params.api_keys.size() == 1) {
-        const auto key = params.api_keys[0];
-        const std::string substr = key.substr(std::max(static_cast<int>(key.length() - 4), 0));
-        SRV_TRC("api_keys: ****%s\n", substr.c_str());
-    } else if (params.api_keys.size() > 1) {
-        SRV_TRC("api_keys: %zu keys loaded\n", params.api_keys.size());
-    }
-
     //
     // Middlewares
     //
@@ -344,9 +343,9 @@ bool server_http_context::init_listener(const common_params & params) {
         return endpoints;
     }();
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
-        // If API key is not set, skip validation
-        if (api_keys.empty()) {
+    auto middleware_validate_api_key = [auth = auth, prefix = params.api_prefix](const httplib::Request & req, httplib::Response & res) {
+        // no key configured: everything is open
+        if (!auth->enabled()) {
             return true;
         }
 
@@ -355,40 +354,45 @@ bool server_http_context::init_listener(const common_params & params) {
             return true;
         }
 
-        // Check for API key in the Authorization header
-        std::string req_api_key = req.get_header_value("Authorization");
-        if (req_api_key.empty()) {
-            // retry with anthropic header
-            req_api_key = req.get_header_value("X-Api-Key");
+        const auto key = auth->find(server_auth::secret_from_headers(req.get_header_value("Authorization"), req.get_header_value("X-Api-Key")));
+        if (!key) {
+            res.status = 401;
+            res.set_content(
+                safe_json_to_str(json {
+                    {"error", {
+                        {"message", "Invalid API Key"},
+                        {"type", "authentication_error"},
+                        {"code", 401}
+                    }}
+                }),
+                "application/json; charset=utf-8"
+            );
+            SRV_WRN("%s", "unauthorized: Invalid API Key\n");
+            return false;
         }
 
-        // remove the "Bearer " prefix if needed
-        static std::string prefix = "Bearer ";
-        if (req_api_key.substr(0, prefix.size()) == prefix) {
-            req_api_key = req_api_key.substr(prefix.size());
+        std::string path = req.path;
+        if (!prefix.empty() && string_starts_with(path, prefix)) {
+            path = path.substr(prefix.size());
         }
-
-        // validate the API key
-        if (std::find(api_keys.begin(), api_keys.end(), req_api_key) != api_keys.end()) {
-            return true; // API key is valid
+        const uint32_t needed = server_auth::required_perm(req.method, path);
+        if (!server_auth::allows(key->perms, needed)) {
+            const std::string perm = server_auth::perm_name(needed);
+            res.status = 403;
+            res.set_content(
+                safe_json_to_str(json {
+                    {"error", {
+                        {"message", "this API key does not have the \"" + perm + "\" permission"},
+                        {"type", "permission_error"},
+                        {"code", 403}
+                    }}
+                }),
+                "application/json; charset=utf-8"
+            );
+            SRV_WRN("forbidden: key %s (%s) lacks \"%s\" for %s %s\n", key->id.c_str(), key->name.c_str(), perm.c_str(), req.method.c_str(), req.path.c_str());
+            return false;
         }
-
-        // API key is invalid or not provided
-        res.status = 401;
-        res.set_content(
-            safe_json_to_str(json {
-                {"error", {
-                    {"message", "Invalid API Key"},
-                    {"type", "authentication_error"},
-                    {"code", 401}
-                }}
-            }),
-            "application/json; charset=utf-8"
-        );
-
-        SRV_WRN("%s", "unauthorized: Invalid API Key\n");
-
-        return false;
+        return true;
     };
 
     auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
@@ -1102,5 +1106,76 @@ void server_http_context::register_gcp_compat() const {
         auto res = std::make_unique<server_http_res>();
         res->data = safe_json_to_str({{"predictions", predictions}});
         return res;
+    });
+}
+
+//
+// API keys
+//
+
+static std::string auth_header(const server_http_req & req, const std::string & name) {
+    for (const auto & [key, value] : req.headers) {
+        if (key.size() == name.size() && std::equal(key.begin(), key.end(), name.begin(),
+                [](char a, char b) { return std::tolower((unsigned char) a) == std::tolower((unsigned char) b); })) {
+            return value;
+        }
+    }
+    return "";
+}
+
+static server_http_res_ptr auth_response(const server_auth_result & r) {
+    auto res = std::make_unique<server_http_res>();
+    res->status = r.status;
+    res->data   = safe_json_to_str(r.body);
+    return res;
+}
+
+void server_http_context::register_auth_routes() const {
+    // the middleware has already checked the key and its permission; the handlers need to know whose it is
+    auto caller = [auth = auth](const server_http_req & req) {
+        return auth->find(server_auth::secret_from_headers(auth_header(req, "Authorization"), auth_header(req, "X-Api-Key")));
+    };
+    auto denied = [auth = auth]() {
+        if (!auth->enabled()) {
+            return auth_response({ 409, json {{"error", {{"code", 409}, {"message", "the server has no API keys: start it with --api-key-file"}, {"type", "conflict_error"}}}} });
+        }
+        return auth_response({ 401, json {{"error", {{"code", 401}, {"message", "Invalid API Key"}, {"type", "authentication_error"}}}} });
+    };
+    auto parse_body = [](const server_http_req & req, json & body) {
+        try {
+            body = req.body.empty() ? json::object() : json::parse(req.body);
+            return body.is_object();
+        } catch (const std::exception &) {
+            return false;
+        }
+    };
+    auto bad_body = []() {
+        return auth_response({ 400, json {{"error", {{"code", 400}, {"message", "the body must be a JSON object"}, {"type", "invalid_request_error"}}}} });
+    };
+
+    get("/keys/me", [auth = auth, caller](const server_http_req & req) {
+        return auth_response({ 200, auth->me(auth->enabled() ? caller(req) : std::nullopt) });
+    });
+    get("/keys", [auth = auth, caller, denied](const server_http_req & req) {
+        const auto me = caller(req);
+        return me ? auth_response(auth->list(*me)) : denied();
+    });
+    post("/keys", [auth = auth, caller, denied, parse_body, bad_body](const server_http_req & req) {
+        const auto me = caller(req);
+        json body;
+        if (!me) { return denied(); }
+        if (!parse_body(req, body)) { return bad_body(); }
+        return auth_response(auth->create(*me, body));
+    });
+    post("/keys/:id", [auth = auth, caller, denied, parse_body, bad_body](const server_http_req & req) {
+        const auto me = caller(req);
+        json body;
+        if (!me) { return denied(); }
+        if (!parse_body(req, body)) { return bad_body(); }
+        return auth_response(auth->update(*me, req.get_param("id"), body));
+    });
+    del("/keys/:id", [auth = auth, caller, denied](const server_http_req & req) {
+        const auto me = caller(req);
+        return me ? auth_response(auth->remove(*me, req.get_param("id"))) : denied();
     });
 }

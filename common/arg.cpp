@@ -3558,19 +3558,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_API_KEY"));
     add_opt(common_arg(
         {"--api-key-file"}, "FNAME",
-        "path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)",
+        "path to file containing API keys, one per line, optionally with permissions (KEY perms=chat,steering  # name); "
+        "lines starting with a hash are comments, and the server re-reads the file when it changes (default: none)",
         [](common_params & params, const std::string & value) {
             std::ifstream key_file(value);
             if (!key_file) {
                 throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
             }
-            std::string key;
-            while (std::getline(key_file, key)) {
-                if (!key.empty() && key[0] != '#') {
-                    params.api_keys.push_back(key);
-                }
-            }
-            key_file.close();
+            params.api_key_file = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
     add_opt(common_arg(

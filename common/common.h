@@ -702,6 +702,7 @@ struct common_params {
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
     std::vector<std::string> api_keys;
+    std::string api_key_file; // keys with permissions, re-read by the server when the file changes
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT

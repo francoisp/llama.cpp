@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 struct common_params;
+class server_auth;
 
 // generator-like API for HTTP response generation
 // this object response with one of the 2 modes:
@@ -92,6 +93,9 @@ struct server_http_context {
     int port    = 9931;
     bool is_ssl = false;
 
+    // API keys and their permissions, set up by init()
+    std::shared_ptr<server_auth> auth;
+
     server_http_context();
     ~server_http_context();
 
@@ -104,6 +108,9 @@ struct server_http_context {
     void post(const std::string & path, const handler_t & handler) const;
     void del(const std::string & path, const handler_t & handler) const;
     void ws(const std::string & path, const ws_handler_t & handler) const;
+
+    // GET /keys/me for any key; GET and POST /keys, POST and DELETE /keys/:id for admin keys
+    void register_auth_routes() const;
 
     // Register the Google Cloud Platform (Vertex AI) compat (AIP_PREDICT_ROUTE env var, or /predict)
     // Must be called AFTER all other API routes are registered
