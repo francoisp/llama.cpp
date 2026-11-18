@@ -1331,17 +1331,38 @@ static bool common_fit_cache_init(common_fit_cache & c, const common_params & pa
             k += "lib " + common_fit_cache_file_id(l) + "\n";
         }
     }
+    // secrets do not change the layout, and the cache file must not hold them
+    static const char * secret_opts[] = { "--api-key", "--hf-token", "-hft", "--connect-code" };
+    static const char * secret_envs[] = { "LLAMA_API_KEY=", "LLAMA_ARG_CONNECT_CODE=" };
     {
         std::ifstream f("/proc/self/cmdline", std::ios::binary);
-        std::string args((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        std::replace(args.begin(), args.end(), '\0', '\x1f');
-        std::replace(args.begin(), args.end(), '\n', '\x1f');
+        std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        // the raw command line with \0 turned into \x1f, as before, so existing cache entries still match
+        const std::vector<std::string> argv = string_split<std::string>(raw, '\0');
+        std::string args;
+        bool redact_next = false;
+        for (size_t i = 0; i < argv.size(); i++) {
+            std::string v = redact_next ? "<redacted>" : argv[i];
+            redact_next = false;
+            for (const char * opt : secret_opts) {
+                if (argv[i] == opt) {
+                    redact_next = true;
+                } else if (argv[i].rfind(std::string(opt) + "=", 0) == 0) {
+                    v = std::string(opt) + "=<redacted>";
+                }
+            }
+            std::replace(v.begin(), v.end(), '\n', '\x1f');
+            args += (i ? "\x1f" : "") + v;
+        }
         k += "args " + args + "\n";
     }
     std::vector<std::string> envs;
     for (char ** e = environ; e && *e; ++e) {
         std::string v = *e;
         if (v.rfind("LLAMA_FIT_CACHE", 0) == 0) {
+            continue;
+        }
+        if (std::any_of(std::begin(secret_envs), std::end(secret_envs), [&](const char * s) { return v.rfind(s, 0) == 0; })) {
             continue;
         }
         for (const char * prefix : { "LLAMA_", "GGML_", "CUDA_", "HIP_", "ROCR_", "GPU_" }) {
